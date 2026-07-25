@@ -1,0 +1,9 @@
+node_modules
+dist
+*.tsbuildinfo
+.vite
+
+# Never commit npm auth tokens or local publish configs
+.npmrc
+*.log
+.DS_Store

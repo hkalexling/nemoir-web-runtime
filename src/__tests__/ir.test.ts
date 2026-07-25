@@ -1,0 +1,121 @@
+/**
+ * IR decoder tests.
+ *
+ * Decodes the real `judge_candidate` workflow JSON (the canonical
+ * web-compatible positive fixture) and asserts structural correctness.
+ * Also tests web-target defensiveness (path/fs/os.shell rejection).
+ */
+
+import { describe, it, expect } from "vitest";
+import { decodeWorkflowIr, validateForWeb } from "../ir.js";
+import { buildWorkflowManifest } from "../manifest.js";
+
+// The canonical web-compatible IR, embedded from the Rust fixture.
+// This mirrors the JSON that `nemo compile --target web` emits.
+import judgeCandidateIr from "./judge-candidate-ir.json" with { type: "json" };
+
+describe("decodeWorkflowIr", () => {
+  it("decodes judge_candidate IR without errors", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    expect(ir.ir_version).toBe("0.1");
+    expect(ir.kind).toBe("workflow_ir");
+    expect(ir.workflow.id).toBe("JudgeCandidate");
+    expect(ir.workflow.entry).toBe("Baseline");
+    expect(ir.workflow.exits).toEqual(["Accept", "Confirm", "Reject"]);
+  });
+
+  it("defaults omitted execution to model", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    // judge_candidate has no explicit execution fields (all model stages).
+    // The decoder should default them to { kind: "model" }.
+    for (const node of ir.nodes) {
+      expect(node.execution.kind).toBe("model");
+    }
+  });
+
+  it("preserves reads and transitions", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    const judgeStage = ir.nodes.find((n) => n.id === "JudgeCandidate")!;
+    expect(judgeStage.reads.length).toBe(2);
+    expect(judgeStage.transitions.length).toBe(3);
+    // The first transition uses a compare/binop guard
+    const firstTrans = judgeStage.transitions[0];
+    expect(firstTrans.guard.kind).toBe("if");
+  });
+
+  it("builds a runtime manifest from decoded IR", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    const manifest = buildWorkflowManifest(ir);
+    expect(manifest.workflowId).toBe("JudgeCandidate");
+    expect(manifest.entryStageId).toBe("Baseline");
+    expect(manifest.exitStageIds.size).toBe(3);
+    expect(manifest.stages.length).toBe(6);
+    // All stages should be model-only
+    for (const stage of manifest.stages) {
+      expect(stage.execution.kind).toBe("model");
+    }
+  });
+});
+
+describe("validateForWeb", () => {
+  it("passes for judge_candidate", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    // decodeWorkflowIr already runs validateForWeb, but test explicitly
+    const issues = validateForWeb(ir);
+    expect(issues).toEqual([]);
+  });
+
+  it("rejects path input types", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.inputs[0].type = "path";
+    const issues = validateForWeb(ir);
+    expect(issues.length).toBe(1);
+    expect(issues[0].message).toContain("path");
+  });
+
+  it("rejects fs.read capability", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("fs.read");
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("fs.read"))).toBe(true);
+  });
+
+  it("rejects os.shell capability", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("os.shell");
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("os.shell"))).toBe(true);
+  });
+
+  it("rejects deterministic tool stages", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.nodes[0].execution = { kind: "tool", capability: "user.confirm" };
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("deterministic"))).toBe(true);
+  });
+
+  it("allows user.elicit and user.confirm", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("user.elicit", "user.confirm");
+    const issues = validateForWeb(ir);
+    expect(issues).toEqual([]);
+  });
+});
+
+describe("decodeWorkflowIr error handling", () => {
+  it("throws on invalid JSON structure", () => {
+    expect(() => decodeWorkflowIr({ not: "valid" })).toThrow();
+  });
+
+  it("throws on path types", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.inputs[0].type = "path";
+    expect(() => decodeWorkflowIr(ir)).toThrow("not compatible with the web target");
+  });
+
+  it("throws on fs.read capability", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("fs.read");
+    expect(() => decodeWorkflowIr(ir)).toThrow("not compatible with the web target");
+  });
+});
