@@ -115,7 +115,8 @@ export function normalizeStageOutput(
       val = null;
     }
     if (val === undefined || val === null) {
-      if (!write.optional) {
+      // json-typed writes may legitimately be null; treat null as present.
+      if (!write.optional && !(val === null && write.type === "json")) {
         throw new ModelOutputValidationError(
           `missing required output field '${write.name}' in stage '${stage.id}'`,
         );
@@ -126,6 +127,33 @@ export function normalizeStageOutput(
     result[write.name] = normalizeWriteValue(write, val, stage.id);
   }
   return result;
+}
+
+/**
+ * Recursively check that a value is JSON-safe for model-output validation.
+ * Cycle-safe (see `isJsonSafeValue`).
+ */
+function isModelJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean {
+  if (value === null) return true;
+  if (typeof value === "string") return true;
+  if (typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    if (seen?.has(value)) return false;
+    seen ??= new WeakSet();
+    seen.add(value);
+    return value.every((v) => isModelJsonSafeValue(v, seen));
+  }
+  if (typeof value === "object") {
+    if (Object.prototype.toString.call(value) !== "[object Object]") return false;
+    if (seen?.has(value)) return false;
+    seen ??= new WeakSet();
+    seen.add(value);
+    return Object.values(value as Record<string, unknown>).every((v) =>
+      isModelJsonSafeValue(v, seen),
+    );
+  }
+  return false;
 }
 
 function normalizeWriteValue(
@@ -162,6 +190,14 @@ function normalizeWriteValue(
         );
       }
       return [...val];
+    case "json":
+      // Recursively validate JSON-safe values (no Set, Map, Function, etc.).
+      if (!isModelJsonSafeValue(val)) {
+        throw new ModelOutputValidationError(
+          `expected JSON-safe value for '${write.name}' in stage '${stageId}', got ${typeof val === "object" && val !== null ? Object.prototype.toString.call(val) : String(val)}`,
+        );
+      }
+      return val;
     default:
       throw new ModelOutputValidationError(
         `unsupported write type '${write.type}' in stage '${stageId}'`,
@@ -196,6 +232,8 @@ function paramTypeToJsonSchema(ty: ToolParamType): Record<string, unknown> {
       return { type: "boolean" };
     case "number":
       return { type: "number" };
+    case "json":
+      return {};
     case "string[]":
       return { type: "array", items: { type: "string" } };
     case "string[] | null":
@@ -207,14 +245,18 @@ function paramTypeToJsonSchema(ty: ToolParamType): Record<string, unknown> {
 export function toolJsonSchema(tool: Tool): Record<string, unknown> {
   const properties: Record<string, Record<string, unknown>> = {};
   const spec = getCapability(tool.capability);
-  const requiredParams = new Set<string>();
+  // Only truly required catalog params are marked required in the schema;
+  // optional catalog params (e.g. http.fetch headers, body) are not.
+  const catalogRequiredNames = new Set<string>();
   if (spec) {
-    for (const p of spec.requiredParams) requiredParams.add(p.name);
+    for (const p of spec.requiredParams) {
+      if (p.required !== false) catalogRequiredNames.add(p.name);
+    }
   }
   const required: string[] = [];
   for (const [name, ty] of Object.entries(tool.inputSchema)) {
     properties[name] = paramTypeToJsonSchema(ty);
-    if (requiredParams.has(name)) required.push(name);
+    if (catalogRequiredNames.has(name)) required.push(name);
   }
   const schema: Record<string, unknown> = {
     type: "object",
@@ -228,12 +270,14 @@ export function toolJsonSchema(tool: Tool): Record<string, unknown> {
 /** Human-readable description of a tool's arguments, for text prompts. */
 function toolArgsDescription(tool: Tool): string {
   const spec = getCapability(tool.capability);
-  const requiredParams = new Set<string>();
+  const catalogRequiredNames = new Set<string>();
   if (spec) {
-    for (const p of spec.requiredParams) requiredParams.add(p.name);
+    for (const p of spec.requiredParams) {
+      if (p.required !== false) catalogRequiredNames.add(p.name);
+    }
   }
   const entries = Object.entries(tool.inputSchema).map(([name, ty]) => {
-    const opt = requiredParams.has(name) ? "required" : "optional";
+    const opt = catalogRequiredNames.has(name) ? "required" : "optional";
     return `"${name}" (${ty}, ${opt})`;
   });
   return entries.length > 0 ? `{ ${entries.join(", ")} }` : "{}";
@@ -273,6 +317,9 @@ export function normalizeToolArgs(
   const spec = getCapability(tool.capability);
   if (spec) {
     for (const p of spec.requiredParams) {
+      // Only truly required catalog params are mandatory; optional
+      // params (e.g. http.fetch headers, body) can be absent.
+      if (p.required === false) continue;
       const v = rawArgs[p.name];
       if (v === undefined || v === null) {
         throw new ModelOutputValidationError(

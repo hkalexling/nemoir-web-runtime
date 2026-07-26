@@ -1,6 +1,6 @@
 {
   "name": "@nemoir/web-runtime",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "TypeScript runtime core for NemoIR — execute compiled agent workflows in the browser as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming.",
   "license": "MIT",
   "type": "module",

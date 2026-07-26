@@ -85,6 +85,42 @@ export function readDisplayKey(ref: { kind: string; name?: string; node?: string
 // Output validation + type checking
 // ---------------------------------------------------------------------------
 
+/**
+ * Recursively check that a value is JSON-safe: plain objects (not Set,
+ * Map, Date, etc.), arrays, strings, finite numbers, booleans, and null.
+ *
+ * Shared by output validation and browser-native tools
+ * (`browser.storage.write` values, `browser.js.run` results) so the
+ * JSON-safe contract is enforced at the tool boundary, not only at
+ * stage-write validation.
+ *
+ * Cycle-safe: tracks visited objects in a WeakSet so a cyclic value
+ * returns `false` rather than overflowing the stack.
+ */
+export function isJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean {
+  if (value === null) return true;
+  if (typeof value === "string") return true;
+  if (typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    if (seen?.has(value)) return false;
+    seen ??= new WeakSet();
+    seen.add(value);
+    return value.every((v) => isJsonSafeValue(v, seen));
+  }
+  if (typeof value === "object") {
+    // Only plain objects — reject Set, Map, Date, class instances, etc.
+    if (Object.prototype.toString.call(value) !== "[object Object]") return false;
+    if (seen?.has(value)) return false;
+    seen ??= new WeakSet();
+    seen.add(value);
+    return Object.values(value as Record<string, unknown>).every((v) =>
+      isJsonSafeValue(v, seen),
+    );
+  }
+  return false;
+}
+
 function validateWriteType(
   value: unknown,
   writeType: string,
@@ -121,6 +157,14 @@ function validateWriteType(
         `Stage '${stageId}' output field '${fieldName}': expected string[] but contains non-string elements`,
       );
     }
+  } else if (writeType === "json") {
+    // Recursively validate that the value is JSON-safe (plain objects,
+    // arrays, primitives, and null — no Set, Map, Function, etc.).
+    if (!isJsonSafeValue(value)) {
+      throw new StageOutputValidationError(
+        `Stage '${stageId}' output field '${fieldName}': expected JSON-safe value, got ${typeof value === "object" && value !== null ? Object.prototype.toString.call(value) : String(value)}`,
+      );
+    }
   } else {
     throw new StageOutputValidationError(
       `Stage '${stageId}' output field '${fieldName}': unsupported type '${writeType}'`,
@@ -139,13 +183,19 @@ function validateOutput(stage: StageSpec, output: Record<string, unknown>): void
   }
   for (const write of stage.writes) {
     const val = output[write.name];
-    if (!write.optional && (val === undefined || val === null)) {
+    // json-typed writes may legitimately be null; treat null as a present
+    // value for json, not as a missing field.
+    if (!write.optional && (val === undefined || (val === null && write.type !== "json"))) {
       throw new StageOutputValidationError(
         `Stage '${stage.id}' is missing required output field '${write.name}'`,
       );
     }
     if (val !== undefined && val !== null) {
       validateWriteType(val, write.type, write.name, stage.id);
+    } else if (val === null && write.type !== "json") {
+      // null is only valid for json writes; skip type-check for null
+    } else if (val === null) {
+      // json-typed null — already validated as present above
     }
   }
 }
@@ -297,6 +347,8 @@ function checkRequiredArgsPresent(
     );
   }
   for (const param of spec.requiredParams) {
+    // Skip optional catalog params — only truly required params must be bound.
+    if (param.required === false) continue;
     if (reqArgs[param.name] === undefined || reqArgs[param.name] === null) {
       throw new PolicyEvaluationError(
         `Policy '${policyId}': required capability '${reqCapability}' is missing catalog-required argument '${param.name}' for original capability '${capability}'`,
@@ -638,8 +690,8 @@ export class WorkflowRuntime {
 
         await emitter.emit("stage_started", { stageId: stage.id });
 
-        // Dispatch: only model stages are supported on web (tool stages
-        // are rejected at compile time and at decode time).
+        // Dispatch: the stage executor handles both model and tool stages.
+        // The composite executor in WorkflowAgent routes by stage.execution.kind.
         const rawOutput = await this.stageExecutor.execute(ctx);
 
         validateOutput(stage, rawOutput);

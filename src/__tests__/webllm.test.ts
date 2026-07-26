@@ -58,6 +58,7 @@ async function makeSession(engine: unknown) {
       ],
     },
     functionCallingModelIds: [],
+    hasModelInCache: async (_id: string) => false,
   }));
   const { createWebllmSession } = await import("../webllm.js");
   return createWebllmSession({
@@ -174,5 +175,128 @@ describe("WebLLM adapter — cancellation", () => {
     ac.abort();
     await p;
     expect(interruptedCount).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Storage assessment (Phase 5)
+// ---------------------------------------------------------------------------
+
+describe("WebLLM session — storage assessment", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+    // Default: no storage estimate API
+    delete (navigator as unknown as Record<string, unknown>).storage;
+  });
+
+  function stubStorageEstimate(quota: number, usage: number) {
+    Object.defineProperty(navigator, "storage", {
+      value: {
+        estimate: async () => ({ quota, usage }),
+      },
+      configurable: true,
+    });
+  }
+
+  function stubNoStorageEstimate() {
+    delete (navigator as unknown as Record<string, unknown>).storage;
+  }
+
+  function stubStorageEstimateThrows() {
+    Object.defineProperty(navigator, "storage", {
+      value: {
+        estimate: async () => { throw new Error("denied"); },
+      },
+      configurable: true,
+    });
+  }
+
+  it("returns supported=false when estimate API is absent", async () => {
+    stubNoStorageEstimate();
+    const { engine } = makeFakeEngine({});
+    const session = await makeSession(engine);
+    const a = await session.assessStorage("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    expect(a.supported).toBe(false);
+    expect(a.likelySufficient).toBe(true); // never block on missing API
+    expect(a.estimatedModelBytes).toBeGreaterThan(0);
+  });
+
+  it("returns likelySufficient=true when enough space is available", async () => {
+    // Model needs ~944 MB. Give it 10 GB available.
+    stubStorageEstimate(20 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024);
+    const { engine } = makeFakeEngine({});
+    const session = await makeSession(engine);
+    const a = await session.assessStorage("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    expect(a.supported).toBe(true);
+    expect(a.likelySufficient).toBe(true);
+  });
+
+  it("returns likelySufficient=false when storage is tight", async () => {
+    // Model needs ~944 MB + margin. Give it only 500 MB available.
+    stubStorageEstimate(1 * 1024 * 1024 * 1024, 500 * 1024 * 1024);
+    const { engine } = makeFakeEngine({});
+    const session = await makeSession(engine);
+    const a = await session.assessStorage("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    expect(a.supported).toBe(true);
+    expect(a.likelySufficient).toBe(false);
+  });
+
+  it("returns likelySufficient=true when estimate throws", async () => {
+    stubStorageEstimateThrows();
+    const { engine } = makeFakeEngine({});
+    const session = await makeSession(engine);
+    const a = await session.assessStorage("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    expect(a.supported).toBe(false);
+    expect(a.likelySufficient).toBe(true);
+  });
+
+  it("respects modelDownloadSizeOverrides for custom models", async () => {
+    stubStorageEstimate(10 * 1024 * 1024 * 1024, 0);
+    const { engine } = makeFakeEngine({});
+    // Create session with an extra model and explicit download size override.
+    vi.doMock("@mlc-ai/web-llm", () => ({
+      CreateWebWorkerMLCEngine: async () => engine,
+      prebuiltAppConfig: {
+        model_list: [
+          { model_id: "Custom-Model-q4f16_1-MLC", vram_required_MB: 1000 },
+        ],
+      },
+      functionCallingModelIds: [],
+      hasModelInCache: async (_id: string) => false,
+    }));
+    const { createWebllmSession } = await import("../webllm.js");
+    const session = await createWebllmSession({
+      workerFactory: () => ({ terminate() {}, postMessage() {} } as unknown as Worker),
+      modelDownloadSizeOverrides: { "Custom-Model-q4f16_1-MLC": 20 * 1024 * 1024 * 1024 }, // 20 GB
+    });
+    const a = await session.assessStorage("Custom-Model-q4f16_1-MLC");
+    expect(a.estimatedModelBytes).toBe(20 * 1024 * 1024 * 1024);
+    // 10 GB available, 20 GB model → insufficient
+    expect(a.likelySufficient).toBe(false);
+  });
+
+  it("returns likelySufficient=true for cached models", async () => {
+    const modelId = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
+    // Mock hasModelInCache to return true
+    vi.doMock("@mlc-ai/web-llm", () => ({
+      CreateWebWorkerMLCEngine: async () => ({}),
+      prebuiltAppConfig: {
+        model_list: [
+          { model_id: modelId, vram_required_MB: 5000, low_resource_required: false },
+        ],
+      },
+      functionCallingModelIds: [],
+      hasModelInCache: async (_id: string) => true,
+    }));
+    // Give very little storage — cached models should still appear sufficient.
+    stubStorageEstimate(1 * 1024 * 1024 * 1024, 900 * 1024 * 1024);
+    const { createWebllmSession } = await import("../webllm.js");
+    const session = await createWebllmSession({
+      workerFactory: () => ({ terminate() {}, postMessage() {} } as unknown as Worker),
+    });
+    const a = await session.assessStorage(modelId);
+    expect(a.isCached).toBe(true);
+    expect(a.likelySufficient).toBe(true);
   });
 });

@@ -170,8 +170,135 @@ describe("WorkflowAgent — UI host", () => {
 });
 
 describe("WorkflowAgent — error handling", () => {
-  it("throws if no model adapter is provided", () => {
+  it("throws if no model adapter is provided for model-stage workflow", () => {
     expect(() => new WorkflowAgent(simpleIr, {} as never)).toThrow("modelAdapter");
+  });
+
+  it("constructs a deterministic-only workflow without modelAdapter", () => {
+    // A minimal IR with all deterministic tool stages (no model stages)
+    const detIr = {
+      ir_version: "0.1",
+      kind: "workflow_ir",
+      source: { frontend: "test", file: "test.nemo" },
+      workflow: {
+        id: "DetOnly",
+        entry: "Confirm",
+        exits: ["Confirm"],
+        transition_semantics: { selection: "first_match_by_priority", no_match: "error_unless_exit" },
+      },
+      inputs: [],
+      capabilities: ["user.confirm"],
+      policies: [],
+      nodes: [{
+        id: "Confirm",
+        annotations: ["entry", "exit"],
+        prompt: "",
+        reads: [],
+        writes: [{ name: "ok", type: "bool", optional: false }],
+        requires: [{ capability: "user.confirm" }],
+        transitions: [],
+        execution: { kind: "tool", capability: "user.confirm", args: { message: { kind: "literal", type: "string", value: "Proceed?" } } },
+      }],
+    };
+    const agent = new WorkflowAgent(detIr, {
+      uiHost: {
+        async elicit() { return ""; },
+        async confirm() { return true; },
+      },
+    });
+    expect(agent.workflowId).toBe("DetOnly");
+  });
+
+  it("runs a deterministic-only workflow end-to-end without a model adapter", async () => {
+    // Medium #3: the prior test only *constructed* the agent; this one
+    // exercises the deterministic dispatch path (resolve args → callTool →
+    // output validation) and asserts the typed result.
+    const detIr = {
+      ir_version: "0.1",
+      kind: "workflow_ir",
+      source: { frontend: "test", file: "test.nemo" },
+      workflow: {
+        id: "DetRun",
+        entry: "Confirm",
+        exits: ["Confirm"],
+        transition_semantics: { selection: "first_match_by_priority", no_match: "error_unless_exit" },
+      },
+      inputs: [],
+      capabilities: ["user.confirm"],
+      policies: [],
+      nodes: [{
+        id: "Confirm",
+        annotations: ["entry", "exit"],
+        prompt: "",
+        reads: [],
+        writes: [{ name: "ok", type: "bool", optional: false }],
+        requires: [{ capability: "user.confirm" }],
+        transitions: [],
+        execution: { kind: "tool", capability: "user.confirm", args: { message: { kind: "literal", type: "string", value: "Proceed?" } } },
+      }],
+    };
+    const agent = new WorkflowAgent(detIr, {
+      uiHost: {
+        async elicit() { return ""; },
+        async confirm() { return true; },
+      },
+    });
+    const result = await agent.run({});
+    expect(result.output).toEqual({ ok: true });
+  });
+
+  it("runs a mixed deterministic-then-model workflow", async () => {
+    // Medium #3: a workflow with a deterministic user.confirm stage feeding a
+    // model stage. Confirms both executors cooperate and the typed output is
+    // produced from the model stage.
+    const mixedIr = {
+      ir_version: "0.1",
+      kind: "workflow_ir",
+      source: { frontend: "test", file: "test.nemo" },
+      workflow: {
+        id: "Mixed",
+        entry: "Confirm",
+        exits: ["Done"],
+        transition_semantics: { selection: "first_match_by_priority", no_match: "error_unless_exit" },
+      },
+      inputs: [],
+      capabilities: ["user.confirm"],
+      policies: [],
+      nodes: [
+        {
+          id: "Confirm",
+          annotations: ["entry"],
+          prompt: "",
+          reads: [],
+          writes: [{ name: "ok", type: "bool", optional: false }],
+          requires: [{ capability: "user.confirm" }],
+          transitions: [{ to: "Done", priority: 0, reason: "fallthrough", guard: { kind: "always" } }],
+          execution: { kind: "tool", capability: "user.confirm", args: { message: { kind: "literal", type: "string", value: "Proceed?" } } },
+        },
+        {
+          id: "Done",
+          annotations: ["exit"],
+          prompt: "Summarize.",
+          reads: [{ ref: { kind: "node_output", node: "Confirm", field: "ok" }, optional: false, origin: "dsl_stage_input" }],
+          writes: [{ name: "summary", type: "string", optional: false }],
+          requires: [],
+          transitions: [],
+        },
+      ],
+    };
+    const { adapter } = fakeAdapter([
+      { content: '{"summary": "confirmed & summarized"}' },
+    ]);
+    const agent = new WorkflowAgent(mixedIr, {
+      modelAdapter: adapter,
+      actionProtocol: "native",
+      uiHost: {
+        async elicit() { return ""; },
+        async confirm() { return true; },
+      },
+    });
+    const result = await agent.run({});
+    expect(result.output).toEqual({ summary: "confirmed & summarized" });
   });
 
   it("throws on path types in the IR", () => {

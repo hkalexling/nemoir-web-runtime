@@ -43,7 +43,8 @@ export type ToolParamType =
   | "boolean"
   | "number"
   | "string[]"
-  | "string[] | null";
+  | "string[] | null"
+  | "json";
 
 export interface Tool {
   readonly name: string;
@@ -63,6 +64,8 @@ function catalogTypeToParamType(ty: CapabilityParamType): ToolParamType {
       return "boolean";
     case "path":
       return "string";
+    case "json":
+      return "json";
   }
 }
 
@@ -70,6 +73,7 @@ const SUPPORTED_PARAM_TYPES: ReadonlySet<ToolParamType> = new Set([
   "string",
   "boolean",
   "number",
+  "json",
   "string[]",
   "string[] | null",
 ]);
@@ -94,6 +98,8 @@ function validateTool(tool: Tool): void {
 
   // Every catalog-required param must be present with the correct type
   for (const param of spec.requiredParams) {
+    // Optional catalog params may be omitted from the tool's input schema.
+    if (param.required === false) continue;
     const expected = catalogTypeToParamType(param.type);
     const actual = tool.inputSchema[param.name];
     if (actual === undefined) {
@@ -199,6 +205,9 @@ export class ToolRegistry implements Iterable<Tool> {
       return await tool.handler(args, ctx);
     } catch (e) {
       if (e instanceof NemoIRRuntimeError) throw e;
+      // Let AbortError pass through for clean cancellation semantics
+      // (mirrors how WebLLM adapter's interrupt path handles AbortError).
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
       throw new ToolInvocationError(
         `tool '${tool.name}' (capability '${tool.capability}') failed: ${e instanceof Error ? e.message : String(e)}`,
       );

@@ -87,11 +87,19 @@ describe("validateForWeb", () => {
     expect(issues.some((i) => i.message.includes("os.shell"))).toBe(true);
   });
 
-  it("rejects deterministic tool stages", () => {
+  it("allows deterministic user.confirm stages on web", () => {
     const ir = decodeWorkflowIr(judgeCandidateIr);
     ir.nodes[0].execution = { kind: "tool", capability: "user.confirm" };
     const issues = validateForWeb(ir);
-    expect(issues.some((i) => i.message.includes("deterministic"))).toBe(true);
+    // user.confirm is web-allowed, so deterministic stage should pass
+    expect(issues.filter((i) => i.path.includes("execution")).length).toBe(0);
+  });
+
+  it("rejects deterministic tool stages with unsupported capabilities", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.nodes[0].execution = { kind: "tool", capability: "fs.read" };
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("fs.read"))).toBe(true);
   });
 
   it("allows user.elicit and user.confirm", () => {

@@ -16,6 +16,7 @@
 import { z } from "zod";
 import {
   isWebAllowedCapability,
+  WEB_DETERMINISTIC_ONLY_CAPABILITIES,
 } from "./capabilities.js";
 
 // ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ export type ExprJson =
   | { kind: "not"; expr: ExprJson }
   | { kind: "method_call"; receiver: ExprJson; method: string; args?: ExprJson[] }
   | { kind: "ref"; ref: RefJson }
-  | { kind: "literal"; type: string; value: string | number | boolean | null }
+  | { kind: "literal"; type: string; value?: unknown }
   | { kind: "and"; exprs?: ExprJson[] }
   | { kind: "or"; exprs?: ExprJson[] }
   | { kind: "compare"; op: string; left: ExprJson; right: ExprJson }
@@ -67,7 +68,10 @@ export const ExprJson: z.ZodType<ExprJson> = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("literal"),
     type: z.string(),
-    value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+    // Literals may carry structured values (objects/arrays) for `json`-typed
+    // exec params; the DSL emits these natively (grammar `json_value`), so the
+    // decoder accepts any JSON value here rather than only scalars.
+    value: z.unknown(),
   }),
   z.object({
     kind: z.literal("and"),
@@ -262,12 +266,41 @@ export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
         });
       }
     }
-    // Deterministic tool stages are rejected on web
-    if (node.execution.kind === "tool") {
-      issues.push({
-        path: `nodes.${node.id}.execution`,
-        message: `deterministic stage "${node.id}" cannot run on the web target`,
-      });
+    // Deterministic tool stages: allowed only for browser-supported capabilities
+    if (node.execution.kind === "tool" && node.execution.capability) {
+      if (!isWebAllowedCapability(node.execution.capability) &&
+          !WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(node.execution.capability)) {
+        issues.push({
+          path: `nodes.${node.id}.execution`,
+          message: `deterministic stage "${node.id}" uses capability "${node.execution.capability}" which is not supported on the web target`,
+        });
+      }
+      // browser.js.run code must be a compile-time string literal
+      if (node.execution.capability === "browser.js.run" && node.execution.args) {
+        const codeExpr = node.execution.args["code"];
+        if (!codeExpr) {
+          issues.push({
+            path: `nodes.${node.id}.execution.args`,
+            message: `deterministic stage "${node.id}" (capability browser.js.run) is missing the required 'code' argument`,
+          });
+        } else if (codeExpr.kind !== "literal" || (codeExpr as { type: string }).type !== "string") {
+          issues.push({
+            path: `nodes.${node.id}.execution.args.code`,
+            message: `deterministic stage "${node.id}" (capability browser.js.run) requires a literal string for the 'code' argument; input/output refs are not allowed`,
+          });
+        }
+      }
+    }
+    // Reject deterministic-only capabilities in model stages
+    if (node.execution.kind === "model") {
+      for (const req of node.requires) {
+        if (WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(req.capability)) {
+          issues.push({
+            path: `nodes.${node.id}.requires`,
+            message: `stage "${node.id}" requires capability "${req.capability}" which is only allowed in deterministic (exec:) stages`,
+          });
+        }
+      }
     }
   }
 
@@ -279,12 +312,25 @@ export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
         message: `policy "${policy.id}" triggers unsupported capability "${policy.trigger.capability}"`,
       });
     }
+    // Deterministic-only capabilities cannot be used in policies
+    if (WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(policy.trigger.capability)) {
+      issues.push({
+        path: `policies.${policy.id}`,
+        message: `policy "${policy.id}" triggers capability "${policy.trigger.capability}" which is deterministic-stage-only and cannot be used in policies`,
+      });
+    }
     if (policy.requires) {
       for (const req of policy.requires) {
         if (!isWebAllowedCapability(req.capability)) {
           issues.push({
             path: `policies.${policy.id}.requires`,
             message: `policy "${policy.id}" requires unsupported capability "${req.capability}"`,
+          });
+        }
+        if (WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(req.capability)) {
+          issues.push({
+            path: `policies.${policy.id}.requires`,
+            message: `policy "${policy.id}" requires capability "${req.capability}" which is deterministic-stage-only and cannot be used in policies`,
           });
         }
       }

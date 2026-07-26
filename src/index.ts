@@ -31,6 +31,7 @@ export {
 export {
   CAPABILITY_CATALOG,
   WEB_ALLOWED_CAPABILITIES,
+  WEB_DETERMINISTIC_ONLY_CAPABILITIES,
   getCapability,
   isKnownCapability,
   isWebAllowedCapability,
@@ -161,4 +162,19 @@ export {
   type WebLlmSessionOptions,
   type WebLlmModelInfo,
   type WebLlmProgressReport,
+  type StorageCapacityAssessment,
 } from "./webllm.js";
+
+// Deterministic stage executor
+export {
+  DeterministicStageExecutor,
+  selectDeterministicTool,
+} from "./deterministic.js";
+
+// Browser-native tools
+export {
+  createBrowserTools,
+  type BrowserToolsOptions,
+  type HttpFetchResult,
+  type JsRunOptions,
+} from "./browser-tools.js";

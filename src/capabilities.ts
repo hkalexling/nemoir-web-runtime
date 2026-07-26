@@ -9,11 +9,13 @@
  * time by `validate_for_web` and defensively re-checked at decode time).
  */
 
-export type CapabilityParamType = "string" | "path" | "bool";
+export type CapabilityParamType = "string" | "path" | "bool" | "json";
 
 export interface CapabilityParam {
   readonly name: string;
   readonly type: CapabilityParamType;
+  /** Whether this parameter is required for deterministic exec stages (default true). */
+  readonly required?: boolean;
 }
 
 export interface CapabilitySpec {
@@ -31,7 +33,7 @@ function makeSpec(
     name,
     requiredParams: params,
     hasRequiredParam(n: string): boolean {
-      return params.some((p) => p.name === n);
+      return params.some((p) => p.name === n && p.required !== false);
     },
   };
 }
@@ -57,18 +59,53 @@ const USER_CONFIRM: CapabilitySpec = makeSpec("user.confirm", [
   { name: "message", type: "string" },
 ]);
 
+// Browser-native capabilities (web target only)
+const HTTP_FETCH: CapabilitySpec = makeSpec("http.fetch", [
+  { name: "url", type: "string" },
+  { name: "method", type: "string" },
+  { name: "headers", type: "json", required: false },
+  { name: "body", type: "json", required: false },
+]);
+
+const BROWSER_STORAGE_READ: CapabilitySpec = makeSpec("browser.storage.read", [
+  { name: "key", type: "string" },
+]);
+
+const BROWSER_STORAGE_WRITE: CapabilitySpec = makeSpec("browser.storage.write", [
+  { name: "key", type: "string" },
+  { name: "value", type: "json" },
+]);
+
+const BROWSER_JS_RUN: CapabilitySpec = makeSpec("browser.js.run", [
+  { name: "code", type: "string" },
+  { name: "input", type: "json" },
+]);
+
 export const CAPABILITY_CATALOG: Readonly<Record<string, CapabilitySpec>> = {
   "fs.read": FS_READ,
   "fs.write": FS_WRITE,
   "os.shell": OS_SHELL,
   "user.elicit": USER_ELICIT,
   "user.confirm": USER_CONFIRM,
+  "http.fetch": HTTP_FETCH,
+  "browser.storage.read": BROWSER_STORAGE_READ,
+  "browser.storage.write": BROWSER_STORAGE_WRITE,
+  "browser.js.run": BROWSER_JS_RUN,
 };
 
-/** Capabilities allowed on the web target. */
+/** Capabilities allowed on the web target (including deterministic-only ones). */
 export const WEB_ALLOWED_CAPABILITIES: readonly string[] = [
   "user.elicit",
   "user.confirm",
+  "http.fetch",
+  "browser.storage.read",
+  "browser.storage.write",
+  "browser.js.run",
+];
+
+/** Capabilities allowed ONLY for deterministic (`exec:`) stages on web. */
+export const WEB_DETERMINISTIC_ONLY_CAPABILITIES: readonly string[] = [
+  "browser.js.run",
 ];
 
 export function getCapability(name: string): CapabilitySpec | undefined {
@@ -86,7 +123,11 @@ export function isWebAllowedCapability(name: string): boolean {
 export function requiredParamNames(name: string): ReadonlySet<string> {
   const spec = getCapability(name);
   if (!spec) return new Set();
-  return new Set(spec.requiredParams.map((p) => p.name));
+  return new Set(
+    spec.requiredParams
+      .filter((p) => p.required !== false)
+      .map((p) => p.name),
+  );
 }
 
 /**
@@ -108,5 +149,6 @@ export const WRITE_TYPE_TO_JSON: Readonly<Record<string, Record<string, unknown>
   bool: { type: "boolean" },
   path: { type: "string" },
   number: { type: "number" },
+  json: {},
   "string[]": { type: "array", items: { type: "string" } },
 };

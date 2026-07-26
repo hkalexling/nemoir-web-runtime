@@ -14,6 +14,14 @@ import type { WorkflowIrJson } from "./ir.js";
 import { decodeWorkflowIr } from "./ir.js";
 import { buildWorkflowManifest, type WorkflowManifest } from "./manifest.js";
 import { ModelStageExecutor, type ActionProtocol } from "./models.js";
+import {
+  DeterministicStageExecutor,
+  selectDeterministicTool,
+} from "./deterministic.js";
+import {
+  createBrowserTools,
+  type BrowserToolsOptions,
+} from "./browser-tools.js";
 import { WorkflowRuntime, type StageContext, type StageExecutor } from "./runtime.js";
 import type { RunOptions, WorkflowResult } from "./runtime-types.js";
 import type { WorkflowEvent } from "./events.js";
@@ -43,6 +51,11 @@ export interface WorkflowAgentOptions {
   tools?: ToolRegistry | Iterable<Tool>;
   /** UI host for browser-safe capabilities. Required if the workflow uses user.elicit/user.confirm. */
   uiHost?: WebUiHost;
+  /**
+   * Options for browser-native tools (http.fetch, browser.storage.*, browser.js.run).
+   * Pass `jsWorkerFactory` when the workflow uses `browser.js.run`.
+   */
+  browserTools?: BrowserToolsOptions;
   /** Default run options (can be overridden per run). */
   defaults?: Partial<RunOptions>;
   /**
@@ -133,7 +146,7 @@ function mergeTools(
 export class WorkflowAgent {
   private readonly manifest: WorkflowManifest;
   private readonly tools: ToolRegistry;
-  private readonly modelAdapter: ModelAdapter | ModelRouter;
+  private readonly modelAdapter?: ModelAdapter | ModelRouter;
   private readonly defaults?: Partial<RunOptions>;
   private readonly actionProtocol?: ActionProtocol;
 
@@ -143,19 +156,28 @@ export class WorkflowAgent {
     this.manifest = buildWorkflowManifest(ir);
     this.actionProtocol = opts.actionProtocol;
 
-    // Check that a model adapter is provided
-    if (!opts.modelAdapter) {
+    // Check that a model adapter is provided when the workflow has model stages.
+    // Deterministic-only workflows do not need a model adapter.
+    const hasModelStages = this.manifest.stages.some(
+      (s) => s.execution.kind === "model",
+    );
+    if (hasModelStages && !opts.modelAdapter) {
       throw new Error(
-        "WorkflowAgent requires a modelAdapter. Real WebLLM/cloud adapters are Phase 3+; for tests, inject a fake adapter.",
+        "WorkflowAgent requires a modelAdapter for workflows with model stages. " +
+          "Pass a WebLLM adapter via `createWebllmAdapter` or inject a fake adapter for tests.",
       );
     }
-    this.modelAdapter = opts.modelAdapter;
+    // Store undefined for deterministic-only workflows.
+    this.modelAdapter = opts.modelAdapter!;
 
     // Build UI tools if a UI host is provided
     const uiTools = opts.uiHost ? createUiTools(opts.uiHost) : [];
 
-    // Merge tools
-    this.tools = mergeTools(opts.tools, uiTools);
+    // Build browser-native tools
+    const browserNativeTools = createBrowserTools(opts.browserTools ?? {});
+
+    // Merge tools: caller first, then UI, then browser-native.
+    this.tools = mergeTools(opts.tools, [...uiTools, ...browserNativeTools]);
 
     // Check that all workflow capabilities are satisfied
     this.tools.requireCapabilities(this.manifest.capabilities);
@@ -214,12 +236,50 @@ export class WorkflowAgent {
   private createRuntime(options?: Partial<RunOptions>): WorkflowRuntime {
     const resolvedOptions = options ?? this.defaults;
     const maxToolRounds = resolvedOptions?.maxToolRounds ?? 32;
-    const executor = new ModelStageExecutor({
-      model: this.modelAdapter,
+
+    // Build deterministic executor + tool selection plan for tool stages
+    const toolForStage = new Map<string, string>();
+    for (const stage of this.manifest.stages) {
+      if (stage.execution.kind === "tool") {
+        const toolName = selectDeterministicTool(stage, this.tools);
+        if (!toolName) {
+          throw new Error(
+            `No tool registered for deterministic stage '${stage.id}' (capability '${stage.execution.capability ?? ""}')`,
+          );
+        }
+        toolForStage.set(stage.id, toolName);
+      }
+    }
+    const deterministicExecutor = new DeterministicStageExecutor({
       tools: this.tools,
-      maxToolRounds,
-      actionProtocol: this.actionProtocol ?? "native",
+      toolForStage,
     });
+
+    // Build model executor (may be unused if no model stages exist)
+    const modelExecutor = this.modelAdapter
+      ? new ModelStageExecutor({
+          model: this.modelAdapter,
+          tools: this.tools,
+          maxToolRounds,
+          actionProtocol: this.actionProtocol ?? "native",
+        })
+      : null;
+
+    // Composite executor that dispatches by stage execution kind
+    const executor: StageExecutor = {
+      async execute(ctx: StageContext): Promise<Record<string, unknown>> {
+        if (ctx.stage.execution.kind === "tool") {
+          return deterministicExecutor.execute(ctx);
+        }
+        if (modelExecutor) {
+          return modelExecutor.execute(ctx);
+        }
+        throw new Error(
+          `Stage '${ctx.stage.id}' is a model stage but no modelAdapter is configured.`,
+        );
+      },
+    };
+
     return new WorkflowRuntime({
       manifest: this.manifest,
       tools: this.tools,

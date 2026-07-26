@@ -17,7 +17,7 @@
  * proxy exposing the OpenAI-shaped `engine.chat.completions.create(...)`.
  *
  * This is the **local privacy-preserving path**. No provider credential or
- * prompt leaves the browser. Cloud transport is Phase 4.
+ * prompt leaves the browser.
  */
 
 import type {
@@ -56,6 +56,33 @@ export interface WebLlmModelInfo {
   readonly requiredFeatures?: readonly string[];
   /** True for models in WebLLM's `functionCallingModelIds` list. */
   readonly supportsFunctionCalling?: boolean;
+  /**
+   * Estimated download size in bytes. When absent the session uses
+   * `vramRequiredMb * 1024 * 1024` as a heuristic. Set explicitly for
+   * custom (extra) models whose download size differs from VRAM.
+   */
+  readonly estimatedDownloadBytes?: number;
+}
+
+export interface StorageCapacityAssessment {
+  /** Whether `navigator.storage.estimate()` is available. */
+  readonly supported: boolean;
+  /** Total quota in bytes, or null if unavailable. */
+  readonly quota: number | null;
+  /** Current usage in bytes, or null if unavailable. */
+  readonly usage: number | null;
+  /** Available bytes (`quota - usage`), or null if unavailable. */
+  readonly available: number | null;
+  /** Estimated model download size in bytes. */
+  readonly estimatedModelBytes: number;
+  /** Conservative margin added to the estimate (bytes). */
+  readonly marginBytes: number;
+  /** True if the model is already cached. */
+  readonly isCached: boolean;
+  /** Best-effort likely-sufficiency judgment. */
+  readonly likelySufficient: boolean;
+  /** Human-readable summary of the assessment. */
+  readonly message: string;
 }
 
 export interface WebLlmSessionOptions {
@@ -71,6 +98,12 @@ export interface WebLlmSessionOptions {
    * supports it (best for large-model persistence), else IndexedDB.
    */
   readonly cacheBackend?: "opfs" | "indexeddb" | "cache" | "cross-origin";
+  /**
+   * Optional per-model download-size overrides (bytes). Keys are model ids.
+   * Use when a custom model's actual download size differs significantly
+   * from the `vram_required_MB` heuristic.
+   */
+  readonly modelDownloadSizeOverrides?: Readonly<Record<string, number>>;
 }
 
 export interface WebLlmSession {
@@ -82,6 +115,13 @@ export interface WebLlmSession {
   isModelLoaded(modelId: string): boolean;
   /** IDs (from `models`) whose artifacts are present in the browser cache. */
   cachedModelIds(): Promise<readonly string[]>;
+  /**
+   * Assess whether there is likely enough browser storage for a model
+   * download. Cached models always return `likelySufficient: true`.
+   * When storage estimates are unavailable, `supported` is false and
+   * `likelySufficient` defaults to true (never block on missing API).
+   */
+  assessStorage(modelId: string): Promise<StorageCapacityAssessment>;
   /** Ensure `modelId` is loaded (download + WebGPU init on first visit). */
   ensureLoaded(modelId: string, signal?: AbortSignal): Promise<void>;
   /** Switch to a different model (unloads the current one first). */
@@ -150,7 +190,15 @@ function humanizeModelId(modelId: string): string {
     .trim();
 }
 
-function toModelInfo(record: ModelRecord, functionCallingIds: ReadonlySet<string>): WebLlmModelInfo {
+function toModelInfo(
+  record: ModelRecord,
+  functionCallingIds: ReadonlySet<string>,
+  downloadSizeOverrides?: Readonly<Record<string, number>>,
+): WebLlmModelInfo {
+  const override = downloadSizeOverrides?.[record.model_id];
+  const estimatedDownloadBytes =
+    override ??
+    (record.vram_required_MB != null ? record.vram_required_MB * 1024 * 1024 : undefined);
   return {
     modelId: record.model_id,
     label: humanizeModelId(record.model_id),
@@ -158,6 +206,7 @@ function toModelInfo(record: ModelRecord, functionCallingIds: ReadonlySet<string
     lowResourceRequired: record.low_resource_required,
     requiredFeatures: record.required_features,
     supportsFunctionCalling: functionCallingIds.has(record.model_id),
+    estimatedDownloadBytes,
   };
 }
 
@@ -346,9 +395,10 @@ export class WebLlmSessionImpl implements WebLlmSession {
       ...webllm.prebuiltAppConfig.model_list,
       ...(this.opts.extraModels ?? []),
     ];
+    const overrides = this.opts.modelDownloadSizeOverrides;
     const infos = records
       .filter(isLlmModel)
-      .map((r) => toModelInfo(r, functionCalling));
+      .map((r) => toModelInfo(r, functionCalling, overrides));
     // Mutate modelInfos in place (it's a readonly array reference held by
     // consumers after the first access, but we only populate once).
     (this.modelInfos as WebLlmModelInfo[]).push(...infos);
@@ -400,6 +450,117 @@ export class WebLlmSessionImpl implements WebLlmSession {
       () => this.engine,
       () => this.interrupt(),
     );
+  }
+
+  // -----------------------------------------------------------------------
+  // Storage assessment (Phase 5)
+  // -----------------------------------------------------------------------
+
+  async assessStorage(modelId: string): Promise<StorageCapacityAssessment> {
+    await this.ensureModelList();
+
+    // Is the model already cached?
+    let isCached = false;
+    try {
+      const cached = await this.cachedModelIds();
+      isCached = cached.includes(modelId);
+    } catch {
+      // If we can't determine cache state, assume not cached.
+    }
+
+    const modelInfo = this.modelInfos.find((m) => m.modelId === modelId);
+    const estimatedModelBytes =
+      modelInfo?.estimatedDownloadBytes ?? 0;
+
+    // Conservative margin: max(512 MiB, 20% of estimated size).
+    const marginBytes = Math.max(
+      512 * 1024 * 1024,
+      Math.round(estimatedModelBytes * 0.2),
+    );
+
+    // Try `navigator.storage.estimate()`.
+    let supported = false;
+    let quota: number | null = null;
+    let usage: number | null = null;
+    let available: number | null = null;
+
+    try {
+      if (
+        typeof navigator !== "undefined" &&
+        typeof navigator.storage === "object" &&
+        navigator.storage !== null &&
+        typeof (navigator.storage as { estimate?: unknown }).estimate === "function"
+      ) {
+        const est = await navigator.storage.estimate();
+        if (est && typeof est.quota === "number" && typeof est.usage === "number") {
+          supported = true;
+          quota = est.quota;
+          usage = est.usage;
+          available = Math.max(0, quota - usage);
+        }
+      }
+    } catch {
+      // estimate() may throw (e.g. in opaque origins).
+    }
+
+    // Cached models always appear sufficient.
+    if (isCached) {
+      const gb = (estimatedModelBytes / (1024 * 1024 * 1024)).toFixed(1);
+      return {
+        supported,
+        quota,
+        usage,
+        available,
+        estimatedModelBytes,
+        marginBytes,
+        isCached: true,
+        likelySufficient: true,
+        message: estimatedModelBytes > 0
+          ? `Model is cached (~${gb} GB). No new download needed.`
+          : "Model is cached. No new download needed.",
+      };
+    }
+
+    if (!supported || available === null) {
+      // Cannot estimate; never block.
+      const gb = (estimatedModelBytes / (1024 * 1024 * 1024)).toFixed(1);
+      return {
+        supported: false,
+        quota: null,
+        usage: null,
+        available: null,
+        estimatedModelBytes,
+        marginBytes,
+        isCached: false,
+        likelySufficient: true,
+        message: estimatedModelBytes > 0
+          ? `Model is not cached (~${gb} GB estimated). Browser storage estimate is unavailable.`
+          : "Storage estimate is unavailable.",
+      };
+    }
+
+    const needed = estimatedModelBytes + marginBytes;
+    const likelySufficient = available >= needed;
+
+    const availGb = (available / (1024 * 1024 * 1024)).toFixed(1);
+    const needGb = (needed / (1024 * 1024 * 1024)).toFixed(1);
+    const modelGb = (estimatedModelBytes / (1024 * 1024 * 1024)).toFixed(1);
+
+    const message = likelySufficient
+      ? `~${availGb} GB available (estimated need: ~${needGb} GB including margin). Storage looks sufficient.`
+      : `Only ~${availGb} GB available. The model needs an estimated ~${modelGb} GB plus ~${((marginBytes) / (1024 * 1024 * 1024)).toFixed(1)} GB safety margin (~${needGb} GB total). Storage may be insufficient. Free browser storage or choose a smaller model.`;
+
+    return {
+      supported,
+      quota,
+      usage,
+      available,
+      estimatedModelBytes,
+      marginBytes,
+      isCached: false,
+      likelySufficient,
+      message,
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -481,7 +642,7 @@ export async function createWebllmSession(
   if (!isWebGPUAvailable()) {
     throw new ModelProviderError(
       "WebGPU is not available in this browser. Use a WebGPU-capable browser " +
-        "(Chrome/Edge 113+, Opera 99+) or a cloud endpoint (Phase 4).",
+        "(Chrome/Edge 113+, Opera 99+).",
     );
   }
   const session = new WebLlmSessionImpl(opts);
