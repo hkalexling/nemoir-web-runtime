@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createBrowserTools } from "../browser-tools.js";
+import type { SandboxedJsRunner } from "../sandbox.js";
 import type { Tool } from "../tools.js";
 
 // ---------------------------------------------------------------------------
@@ -544,6 +545,57 @@ describe("browser.js.run", () => {
     const jsRunTool = tools.find((t) => t.capability === "browser.js.run");
     // No jsWorkerFactory → no js.run tool should be created
     expect(jsRunTool).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// browser.js.sandbox
+// ---------------------------------------------------------------------------
+
+describe("browser.js.sandbox", () => {
+  it("forwards dynamic source and JSON input to the configured opaque-origin runner", async () => {
+    const runner: SandboxedJsRunner = {
+      run: vi.fn().mockResolvedValue({ result: 42 }),
+    };
+    const tools = createBrowserTools({
+      jsSandboxRunner: runner,
+      jsSandboxTimeoutMs: 321,
+      jsSandboxMaxCodeBytes: 123,
+      jsSandboxMaxInputBytes: 456,
+      jsSandboxMaxOutputBytes: 789,
+    });
+    const sandboxTool = findTool(tools, "browser.js.sandbox");
+
+    await expect(callTool(sandboxTool, {
+      code: "return { result: input.x + 1 };",
+      input: { x: 41 },
+    })).resolves.toEqual({ result: 42 });
+
+    expect(runner.run).toHaveBeenCalledWith(expect.objectContaining({
+      code: "return { result: input.x + 1 };",
+      input: { x: 41 },
+      timeoutMs: 321,
+      maxCodeBytes: 123,
+      maxInputBytes: 456,
+      maxOutputBytes: 789,
+    }));
+  });
+
+  it("rejects a non-string source before invoking the runner", async () => {
+    const runner: SandboxedJsRunner = { run: vi.fn() };
+    const sandboxTool = findTool(
+      createBrowserTools({ jsSandboxRunner: runner }),
+      "browser.js.sandbox",
+    );
+
+    await expect(callTool(sandboxTool, { code: { not: "code" }, input: {} }))
+      .rejects.toThrow("code must be a string");
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it("is not registered without an explicit sandbox runner", () => {
+    const tools = createBrowserTools({});
+    expect(tools.find((t) => t.capability === "browser.js.sandbox")).toBeUndefined();
   });
 });
 

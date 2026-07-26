@@ -53,6 +53,13 @@ export interface Tool {
   readonly inputSchema: Record<string, ToolParamType>;
   readonly handler: ToolHandler;
   readonly outputSchema?: Record<string, string> | null;
+  /**
+   * Optional runtime pre-policy preflight: called with the resolved tool args
+   * before deny/before policies run. Lets a tool reject an input (e.g. an
+   * oversized `code` value) before any confirmation UI renders or the handler
+   * is invoked. Throws a NemoIRRuntimeError subclass to fail closed.
+   */
+  readonly preflight?: (args: Record<string, unknown>) => void;
 }
 
 /** Map a catalog param type to the NemoIR web type. */

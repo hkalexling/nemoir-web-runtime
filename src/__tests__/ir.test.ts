@@ -108,6 +108,140 @@ describe("validateForWeb", () => {
     const issues = validateForWeb(ir);
     expect(issues).toEqual([]);
   });
+
+  it("allows dynamic sandbox source only with explicit confirmation policy", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.inputs.push({ id: "user_code", type: "string" });
+    ir.capabilities.push("browser.js.sandbox", "user.confirm");
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+    ir.nodes[0].execution = {
+      kind: "tool",
+      capability: "browser.js.sandbox",
+      args: {
+        code: { kind: "ref", ref: { kind: "input", name: "user_code" } },
+        input: { kind: "literal", type: "json", value: {} },
+      },
+    };
+    ir.policies.push({
+      id: "before browser.js.sandbox(code) requires user.confirm",
+      kind: "before",
+      trigger: {
+        capability: "browser.js.sandbox",
+        bind: { code: { kind: "arg", name: "code" } },
+      },
+      requires: [{ capability: "user.confirm", args: {} }],
+    });
+
+    expect(validateForWeb(ir)).toEqual([]);
+  });
+
+  it("rejects dynamic sandbox without explicit confirmation policy", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("browser.js.sandbox");
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+    ir.nodes[0].execution = {
+      kind: "tool",
+      capability: "browser.js.sandbox",
+      args: {
+        code: { kind: "literal", type: "string", value: "return { ok: true };" },
+        input: { kind: "literal", type: "json", value: {} },
+      },
+    };
+
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("explicit approval policy"))).toBe(true);
+  });
+
+  it("rejects browser.js.sandbox in a model stage", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("browser.js.sandbox");
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("only allowed in deterministic"))).toBe(true);
+  });
+
+  it("rejects browser.js.sandbox code ref to a json input", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.inputs.push({ id: "user_code", type: "json" });
+    ir.capabilities.push("browser.js.sandbox", "user.confirm");
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+    ir.nodes[0].execution = {
+      kind: "tool",
+      capability: "browser.js.sandbox",
+      args: {
+        code: { kind: "ref", ref: { kind: "input", name: "user_code" } },
+        input: { kind: "literal", type: "json", value: {} },
+      },
+    };
+    ir.policies.push({
+      id: "before browser.js.sandbox(code) requires user.confirm",
+      kind: "before",
+      trigger: {
+        capability: "browser.js.sandbox",
+        bind: { code: { kind: "arg", name: "code" } },
+      },
+      requires: [{ capability: "user.confirm", args: {} }],
+    });
+
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("non-optional string"))).toBe(true);
+  });
+
+  it("rejects browser.js.sandbox code ref to a json node-output write", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("browser.js.sandbox", "user.confirm");
+    // Give the first node a json-typed `code` write it can reference.
+    ir.nodes[0].writes = [{ name: "code", type: "json", optional: false }];
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+    ir.nodes[0].execution = {
+      kind: "tool",
+      capability: "browser.js.sandbox",
+      args: {
+        code: { kind: "ref", ref: { kind: "node_output", node: ir.nodes[0].id, field: "code" } },
+        input: { kind: "literal", type: "json", value: {} },
+      },
+    };
+    ir.policies.push({
+      id: "before browser.js.sandbox(code) requires user.confirm",
+      kind: "before",
+      trigger: {
+        capability: "browser.js.sandbox",
+        bind: { code: { kind: "arg", name: "code" } },
+      },
+      requires: [{ capability: "user.confirm", args: {} }],
+    });
+
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("non-optional string"))).toBe(true);
+  });
+
+  it("rejects browser.js.sandbox code ref to an optional string node-output write", () => {
+    const ir = decodeWorkflowIr(judgeCandidateIr);
+    ir.capabilities.push("browser.js.sandbox", "user.confirm");
+    ir.nodes[0].writes = [{ name: "code", type: "string", optional: true }];
+    ir.nodes[0].requires.push({ capability: "browser.js.sandbox" });
+    ir.nodes[0].execution = {
+      kind: "tool",
+      capability: "browser.js.sandbox",
+      args: {
+        code: { kind: "ref", ref: { kind: "node_output", node: ir.nodes[0].id, field: "code" } },
+        input: { kind: "literal", type: "json", value: {} },
+      },
+    };
+    ir.policies.push({
+      id: "before browser.js.sandbox(code) requires user.confirm",
+      kind: "before",
+      trigger: {
+        capability: "browser.js.sandbox",
+        bind: { code: { kind: "arg", name: "code" } },
+      },
+      requires: [{ capability: "user.confirm", args: {} }],
+    });
+
+    const issues = validateForWeb(ir);
+    expect(issues.some((i) => i.message.includes("non-optional string"))).toBe(true);
+  });
 });
 
 describe("decodeWorkflowIr error handling", () => {

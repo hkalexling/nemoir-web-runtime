@@ -81,6 +81,15 @@ const BROWSER_JS_RUN: CapabilitySpec = makeSpec("browser.js.run", [
   { name: "input", type: "json" },
 ]);
 
+/**
+ * Dynamic code is executed only by the opaque-origin sandbox runner. Its
+ * `code` value may be a workflow input or a prior model-stage output.
+ */
+const BROWSER_JS_SANDBOX: CapabilitySpec = makeSpec("browser.js.sandbox", [
+  { name: "code", type: "string" },
+  { name: "input", type: "json" },
+]);
+
 export const CAPABILITY_CATALOG: Readonly<Record<string, CapabilitySpec>> = {
   "fs.read": FS_READ,
   "fs.write": FS_WRITE,
@@ -91,6 +100,7 @@ export const CAPABILITY_CATALOG: Readonly<Record<string, CapabilitySpec>> = {
   "browser.storage.read": BROWSER_STORAGE_READ,
   "browser.storage.write": BROWSER_STORAGE_WRITE,
   "browser.js.run": BROWSER_JS_RUN,
+  "browser.js.sandbox": BROWSER_JS_SANDBOX,
 };
 
 /** Capabilities allowed on the web target (including deterministic-only ones). */
@@ -101,11 +111,13 @@ export const WEB_ALLOWED_CAPABILITIES: readonly string[] = [
   "browser.storage.read",
   "browser.storage.write",
   "browser.js.run",
+  "browser.js.sandbox",
 ];
 
 /** Capabilities allowed ONLY for deterministic (`exec:`) stages on web. */
 export const WEB_DETERMINISTIC_ONLY_CAPABILITIES: readonly string[] = [
   "browser.js.run",
+  "browser.js.sandbox",
 ];
 
 export function getCapability(name: string): CapabilitySpec | undefined {

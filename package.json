@@ -1,6 +1,6 @@
 {
   "name": "@nemoir/web-runtime",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "TypeScript runtime core for NemoIR — execute compiled agent workflows in the browser as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming.",
   "license": "MIT",
   "type": "module",
@@ -24,6 +24,7 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "typescript": "^5.6.0",
     "vitest": "^2.0.0"
   },
@@ -32,9 +33,26 @@
     "react-dom": "^18.0.0 || ^19.0.0"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true },
-    "react-dom": { "optional": true }
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
-  "keywords": ["nemoir", "agent", "workflow", "llm", "compiler", "runtime", "browser", "webllm"],
-  "files": ["dist", "src", "README.md"]
+  "keywords": [
+    "nemoir",
+    "agent",
+    "workflow",
+    "llm",
+    "compiler",
+    "runtime",
+    "browser",
+    "webllm"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ]
 }

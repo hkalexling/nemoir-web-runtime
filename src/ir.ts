@@ -211,6 +211,24 @@ function typeUsesPath(ty: string): boolean {
   return ty.includes("path");
 }
 
+/**
+ * The dynamic-code capability must be paired with an inspectable approval
+ * policy. The runtime uses the bound `code` value to render the source in the
+ * generated UI's `user.confirm` prompt.
+ */
+function isSandboxApprovalPolicy(policy: z.infer<typeof PolicyJson>): boolean {
+  if (policy.kind !== "before" || policy.trigger.capability !== "browser.js.sandbox") {
+    return false;
+  }
+  const codeBinding = policy.trigger.bind.code;
+  if (!codeBinding || codeBinding.kind !== "arg" || codeBinding.name !== "code") {
+    return false;
+  }
+  return (policy.requires ?? []).some(
+    (req) => req.capability === "user.confirm" && Object.keys(req.args).length === 0,
+  );
+}
+
 export interface WebValidationIssue {
   readonly path: string;
   readonly message: string;
@@ -225,6 +243,26 @@ export interface WebValidationIssue {
  */
 export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
   const issues: WebValidationIssue[] = [];
+
+  // Resolve input types by name (inputs are never optional in the IR).
+  const inputTypes = new Map<string, string>(
+    ir.inputs.map((inp) => [inp.id, inp.type]),
+  );
+  // Resolve node output writes as node -> (field -> write).
+  const writesPerNode = new Map<
+    string,
+    Map<string, { type: string; optional: boolean }>
+  >();
+  for (const node of ir.nodes) {
+    const writes = new Map<
+      string,
+      { type: string; optional: boolean }
+    >();
+    for (const w of node.writes) {
+      writes.set(w.name, { type: w.type, optional: w.optional });
+    }
+    writesPerNode.set(node.id, writes);
+  }
 
   // Top-level capabilities
   for (const cap of ir.capabilities) {
@@ -275,19 +313,68 @@ export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
           message: `deterministic stage "${node.id}" uses capability "${node.execution.capability}" which is not supported on the web target`,
         });
       }
-      // browser.js.run code must be a compile-time string literal
-      if (node.execution.capability === "browser.js.run" && node.execution.args) {
-        const codeExpr = node.execution.args["code"];
+      // browser.js.run code must be a compile-time string literal.
+      if (node.execution.capability === "browser.js.run") {
+        const codeExpr = node.execution.args?.["code"];
         if (!codeExpr) {
           issues.push({
             path: `nodes.${node.id}.execution.args`,
             message: `deterministic stage "${node.id}" (capability browser.js.run) is missing the required 'code' argument`,
           });
-        } else if (codeExpr.kind !== "literal" || (codeExpr as { type: string }).type !== "string") {
+        } else if (codeExpr.kind !== "literal" || codeExpr.type !== "string") {
           issues.push({
             path: `nodes.${node.id}.execution.args.code`,
             message: `deterministic stage "${node.id}" (capability browser.js.run) requires a literal string for the 'code' argument; input/output refs are not allowed`,
           });
+        }
+      }
+
+      // browser.js.sandbox is the deliberately dynamic path. Its source may
+      // be a string literal, workflow input, or prior stage output; never an
+      // arbitrary expression. The catalog declares `code: String`, so the
+      // referenced value must resolve to a non-optional string. The mandatory
+      // approval policy is checked below.
+      if (node.execution.capability === "browser.js.sandbox") {
+        const codeExpr = node.execution.args?.["code"];
+        if (!codeExpr) {
+          issues.push({
+            path: `nodes.${node.id}.execution.args`,
+            message: `deterministic stage "${node.id}" (capability browser.js.sandbox) is missing the required 'code' argument`,
+          });
+        } else if (
+          !(
+            (codeExpr.kind === "literal" && codeExpr.type === "string") ||
+            codeExpr.kind === "ref"
+          )
+        ) {
+          issues.push({
+            path: `nodes.${node.id}.execution.args.code`,
+            message: `deterministic stage "${node.id}" (capability browser.js.sandbox) requires 'code' to be a string literal or input/output ref`,
+          });
+        } else if (codeExpr.kind === "ref") {
+          const ref = codeExpr.ref;
+          if (ref.kind === "input") {
+            const ty = inputTypes.get(ref.name ?? "");
+            if (ty !== undefined && ty !== "string") {
+              issues.push({
+                path: `nodes.${node.id}.execution.args.code`,
+                message: `deterministic stage "${node.id}" (capability browser.js.sandbox) 'code' must resolve to a non-optional string, but input '${ref.name}' has type '${ty}'`,
+              });
+            }
+          } else if (ref.kind === "node_output") {
+            const w = writesPerNode
+              .get(ref.node ?? "")
+              ?.get(ref.field ?? "");
+            if (
+              w !== undefined &&
+              !(w.type === "string" && !w.optional)
+            ) {
+              issues.push({
+                path: `nodes.${node.id}.execution.args.code`,
+                message: `deterministic stage "${node.id}" (capability browser.js.sandbox) 'code' must resolve to a non-optional string, but output '${ref.node}.${ref.field}' has type '${w.type}${w.optional ? "?" : ""}'`,
+              });
+            }
+          }
         }
       }
     }
@@ -313,10 +400,22 @@ export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
       });
     }
     // Deterministic-only capabilities cannot be used in policies
-    if (WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(policy.trigger.capability)) {
+    if (
+      WEB_DETERMINISTIC_ONLY_CAPABILITIES.includes(policy.trigger.capability) &&
+      policy.trigger.capability !== "browser.js.sandbox"
+    ) {
       issues.push({
         path: `policies.${policy.id}`,
         message: `policy "${policy.id}" triggers capability "${policy.trigger.capability}" which is deterministic-stage-only and cannot be used in policies`,
+      });
+    }
+    if (
+      policy.trigger.capability === "browser.js.sandbox" &&
+      !isSandboxApprovalPolicy(policy)
+    ) {
+      issues.push({
+        path: `policies.${policy.id}`,
+        message: `policy "${policy.id}" must approve browser.js.sandbox with \`before browser.js.sandbox(code) requires user.confirm\``,
       });
     }
     if (policy.requires) {
@@ -335,6 +434,22 @@ export function validateForWeb(ir: WorkflowIrJson): WebValidationIssue[] {
         }
       }
     }
+  }
+
+  const sandboxIsUsed = ir.nodes.some(
+    (node) => node.execution.kind === "tool" && node.execution.capability === "browser.js.sandbox",
+  );
+  if (sandboxIsUsed && !ir.policies.some(isSandboxApprovalPolicy)) {
+    issues.push({
+      path: "policies",
+      message: "browser.js.sandbox requires an explicit approval policy: `before browser.js.sandbox(code) requires user.confirm`",
+    });
+  }
+  if (sandboxIsUsed && !ir.capabilities.includes("user.confirm")) {
+    issues.push({
+      path: "capabilities",
+      message: "browser.js.sandbox requires user.confirm to be declared in top-level capabilities",
+    });
   }
 
   return issues;

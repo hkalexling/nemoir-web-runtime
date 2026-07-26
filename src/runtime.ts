@@ -357,6 +357,17 @@ function checkRequiredArgsPresent(
   }
 }
 
+function sandboxApprovalMessage(args: Record<string, unknown>): string {
+  const code = typeof args.code === "string" ? args.code : "";
+  return [
+    "Run sandboxed JavaScript?",
+    "It receives only this workflow stage's declared JSON input. Network APIs are restricted by CSP; host-page, host-origin storage, and NemoIR tool access are not exposed.",
+    "",
+    "Source:",
+    code,
+  ].join("\n");
+}
+
 function safeResultPreview(value: unknown): string | null {
   const MAX = 200;
   if (value === null || value === undefined) return "null";
@@ -519,6 +530,15 @@ export class WorkflowRuntime {
     const { allowBefore, runOpts, emitter, toolName } = opts;
     const policies = this.policiesByTrigger.get(capability) ?? [];
 
+    // --- Tool preflight (before policies render UI / build messages) ---
+    // Resolved the same way as the tool-call section below so a tool's own
+    // configured limits (e.g. jsSandboxMaxCodeBytes) govern the pre-policy
+    // path, not just the runner execution path.
+    const preflightTool = toolName
+      ? this.tools.getByName(toolName)
+      : this.tools.get(capability);
+    preflightTool?.preflight?.(args);
+
     // --- Deny policies ---
     for (const policy of policies) {
       if (policy.kind === "deny" && policy.condition) {
@@ -575,12 +595,16 @@ export class WorkflowRuntime {
         }
         for (const req of policy.requires) {
           const reqArgs = resolveRequiredArgs(req, inputs, boundArgs, policy.id, capability);
-          // Special case: user.confirm without explicit args
+          // Special case: user.confirm without explicit args. Dynamic code
+          // workflows are required to declare this policy form; show the
+          // actual source before the opaque-origin sandbox is created.
           if (
             Object.keys(reqArgs).length === 0 &&
             req.capability === "user.confirm"
           ) {
-            reqArgs.message = `Allow policy-required call before ${capability}?`;
+            reqArgs.message = capability === "browser.js.sandbox"
+              ? sandboxApprovalMessage(args)
+              : `Allow policy-required call before ${capability}?`;
           }
           checkRequiredArgsPresent(req.capability, reqArgs, policy.id, capability);
           // Recursively enforce (deny policies still apply, but not nested before)

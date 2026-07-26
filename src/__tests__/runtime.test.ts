@@ -8,9 +8,13 @@
  * normalization.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { WorkflowRuntime } from "../runtime.js";
 import { ToolRegistry } from "../tools.js";
+import type { Tool } from "../tools.js";
+import { createBrowserTools } from "../browser-tools.js";
+import type { SandboxedJsRunner } from "../sandbox.js";
+import { DEFAULT_JS_SANDBOX_MAX_CODE_BYTES } from "../sandbox.js";
 import {
   scriptedExecutor,
   makeManifest,
@@ -622,5 +626,249 @@ describe("WorkflowRuntime.run — cancellation", () => {
     const after = executeStarted;
     await new Promise((r) => setTimeout(r, 30));
     expect(executeStarted).toBe(after);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic sandbox confirmation policy
+// ---------------------------------------------------------------------------
+
+describe("WorkflowRuntime.run — browser.js.sandbox approval", () => {
+  it("renders dynamic source in the mandatory user.confirm policy before execution", async () => {
+    const confirmationMessages: string[] = [];
+    const tools = new ToolRegistry([
+      {
+        name: "confirm",
+        capability: "user.confirm",
+        description: "confirm dynamic source",
+        inputSchema: { message: "string" },
+        handler: async (args) => {
+          confirmationMessages.push(args.message as string);
+          return true;
+        },
+      },
+      {
+        name: "js_sandbox",
+        capability: "browser.js.sandbox",
+        description: "isolated dynamic code",
+        inputSchema: { code: "string", input: "json" },
+        handler: async () => ({ value: 42 }),
+      },
+    ] satisfies Tool[]);
+
+    const source = "return { value: input.x + 1 };";
+    const stage = makeStage("Sandbox", {
+      writes: [makeWrite("result", "json")],
+      requires: new Set(["browser.js.sandbox"]),
+      execution: { kind: "tool", capability: "browser.js.sandbox", args: new Map() },
+    });
+    const manifest = makeManifest([stage], {
+      exitIds: new Set(["Sandbox"]),
+      capabilities: new Set(["browser.js.sandbox", "user.confirm"]),
+      policies: [{
+        id: "before browser.js.sandbox(code) requires user.confirm",
+        kind: "before",
+        trigger: {
+          capability: "browser.js.sandbox",
+          bind: new Map([["code", "code"]]),
+        },
+        requires: [{ capability: "user.confirm", args: new Map() }],
+      }],
+    });
+    const runtime = new WorkflowRuntime({
+      manifest,
+      tools,
+      stageExecutor: {
+        async execute(ctx) {
+          const result = await ctx.callTool(
+            "browser.js.sandbox",
+            { code: source, input: { x: 41 } },
+            "js_sandbox",
+          );
+          return { result };
+        },
+      },
+    });
+
+    await expect(runtime.run({ task: "test" })).resolves.toMatchObject({
+      output: { result: { value: 42 } },
+    });
+    expect(confirmationMessages).toHaveLength(1);
+    expect(confirmationMessages[0]).toContain("Run sandboxed JavaScript?");
+    expect(confirmationMessages[0]).toContain(source);
+  });
+
+  it("rejects oversized source before rendering the confirmation UI (default cap)", async () => {
+    // Uses createBrowserTools so the tool carries the configured-cap preflight
+    // (not the old hard-coded runtime check).
+    const confirmHandler = vi.fn().mockResolvedValue(true);
+    const sandboxRunner = { run: vi.fn().mockResolvedValue({ value: 42 }) };
+    const tools = new ToolRegistry([
+      {
+        name: "confirm",
+        capability: "user.confirm",
+        description: "confirm dynamic source",
+        inputSchema: { message: "string" },
+        handler: confirmHandler,
+      },
+      ...createBrowserTools({
+        jsSandboxRunner: sandboxRunner as unknown as SandboxedJsRunner,
+      }),
+    ]);
+
+    const oversize = "x".repeat(DEFAULT_JS_SANDBOX_MAX_CODE_BYTES + 1);
+    const stage = makeStage("Sandbox", {
+      writes: [makeWrite("result", "json")],
+      requires: new Set(["browser.js.sandbox"]),
+      execution: { kind: "tool", capability: "browser.js.sandbox", args: new Map() },
+    });
+    const manifest = makeManifest([stage], {
+      exitIds: new Set(["Sandbox"]),
+      capabilities: new Set(["browser.js.sandbox", "user.confirm"]),
+      policies: [{
+        id: "before browser.js.sandbox(code) requires user.confirm",
+        kind: "before",
+        trigger: {
+          capability: "browser.js.sandbox",
+          bind: new Map([[
+            "code", "code"]]),
+        },
+        requires: [{ capability: "user.confirm", args: new Map() }],
+      }],
+    });
+    const runtime = new WorkflowRuntime({
+      manifest,
+      tools,
+      stageExecutor: {
+        async execute(ctx) {
+          const result = await ctx.callTool(
+            "browser.js.sandbox",
+            { code: oversize, input: {} },
+            "js_sandbox",
+          );
+          return { result };
+        },
+      },
+    });
+
+    await expect(runtime.run({ task: "test" })).rejects.toThrow(/exceeds .* byte limit/);
+    expect(confirmHandler).not.toHaveBeenCalled();
+    expect(sandboxRunner.run).not.toHaveBeenCalled();
+  });
+
+  it("respects a smaller configured cap at the confirmation UI", async () => {
+    const confirmHandler = vi.fn().mockResolvedValue(true);
+    const sandboxRunner = { run: vi.fn().mockResolvedValue({ value: 42 }) };
+    const tools = new ToolRegistry([
+      {
+        name: "confirm",
+        capability: "user.confirm",
+        description: "confirm dynamic source",
+        inputSchema: { message: "string" },
+        handler: confirmHandler,
+      },
+      ...createBrowserTools({
+        jsSandboxRunner: sandboxRunner as unknown as SandboxedJsRunner,
+        jsSandboxMaxCodeBytes: 10,
+      }),
+    ]);
+    const stage = makeStage("Sandbox", {
+      writes: [makeWrite("result", "json")],
+      requires: new Set(["browser.js.sandbox"]),
+      execution: { kind: "tool", capability: "browser.js.sandbox", args: new Map() },
+    });
+    const manifest = makeManifest([stage], {
+      exitIds: new Set(["Sandbox"]),
+      capabilities: new Set(["browser.js.sandbox", "user.confirm"]),
+      policies: [{
+        id: "before browser.js.sandbox(code) requires user.confirm",
+        kind: "before",
+        trigger: {
+          capability: "browser.js.sandbox",
+          bind: new Map([[
+            "code", "code"]]),
+        },
+        requires: [{ capability: "user.confirm", args: new Map() }],
+      }],
+    });
+    const runtime = new WorkflowRuntime({
+      manifest,
+      tools,
+      stageExecutor: {
+        async execute(ctx) {
+          const result = await ctx.callTool(
+            "browser.js.sandbox",
+            { code: "x".repeat(11), input: {} },
+            "js_sandbox",
+          );
+          return { result };
+        },
+      },
+    });
+
+    await expect(runtime.run({ task: "test" })).rejects.toThrow(/exceeds 10 byte limit/);
+    expect(confirmHandler).not.toHaveBeenCalled();
+    expect(sandboxRunner.run).not.toHaveBeenCalled();
+  });
+
+  it("accepts source under a larger configured cap at the confirmation UI", async () => {
+    const confirmHandler = vi.fn().mockResolvedValue(true);
+    const sandboxRunner = { run: vi.fn().mockResolvedValue({ value: 42 }) };
+    const tools = new ToolRegistry([
+      {
+        name: "confirm",
+        capability: "user.confirm",
+        description: "confirm dynamic source",
+        inputSchema: { message: "string" },
+        handler: confirmHandler,
+      },
+      ...createBrowserTools({
+        jsSandboxRunner: sandboxRunner as unknown as SandboxedJsRunner,
+        // 70_000 > default 64 KiB; proves a larger configured cap is honored.
+        jsSandboxMaxCodeBytes: 70_000,
+      }),
+    ]);
+    const source = "x".repeat(65_000) + "return { value: 42 };";
+    const stage = makeStage("Sandbox", {
+      writes: [makeWrite("result", "json")],
+      requires: new Set(["browser.js.sandbox"]),
+      execution: { kind: "tool", capability: "browser.js.sandbox", args: new Map() },
+    });
+    const manifest = makeManifest([stage], {
+      exitIds: new Set(["Sandbox"]),
+      capabilities: new Set(["browser.js.sandbox", "user.confirm"]),
+      policies: [{
+        id: "before browser.js.sandbox(code) requires user.confirm",
+        kind: "before",
+        trigger: {
+          capability: "browser.js.sandbox",
+          bind: new Map([[
+            "code", "code"]]),
+        },
+        requires: [{ capability: "user.confirm", args: new Map() }],
+      }],
+    });
+    const runtime = new WorkflowRuntime({
+      manifest,
+      tools,
+      stageExecutor: {
+        async execute(ctx) {
+          const result = await ctx.callTool(
+            "browser.js.sandbox",
+            { code: source, input: {} },
+            "js_sandbox",
+          );
+          return { result };
+        },
+      },
+    });
+
+    await expect(runtime.run({ task: "test" })).resolves.toMatchObject({
+      output: { result: { value: 42 } },
+    });
+    expect(confirmHandler).toHaveBeenCalledTimes(1);
+    expect(sandboxRunner.run).toHaveBeenCalledWith(
+      expect.objectContaining({ code: source }),
+    );
   });
 });

@@ -34,6 +34,41 @@ not require React.
   model adapters (WebLLM `engine.interruptGenerate()`) and UI-host tools,
   and `WorkflowRuntime.stream()` aborts its background run on early
   consumer break.
+- **Dynamic code is explicit and policy-gated.** `browser.js.sandbox` is for
+  a user input or prior model-stage output that a later deterministic stage
+  executes only after `before browser.js.sandbox(code) requires user.confirm`.
+  It is never exposed as a model-callable tool.
+
+## Dynamic JavaScript sandbox
+
+Keep `browser.js.run` for compile-time literal, trusted workflow-author code.
+For run-time user or LLM source, use `browser.js.sandbox` in a deterministic
+stage and declare the approval policy:
+
+```nemo
+policy { before browser.js.sandbox(code) requires user.confirm }
+```
+
+Generated browser apps wire `createOpaqueOriginJsSandbox()` automatically. It
+creates a fresh opaque-origin iframe (`sandbox="allow-scripts"` without
+`allow-same-origin`) with a strict CSP and a nested Worker. Dynamic code gets
+only JSON input, no direct DOM/host-origin-storage/NemoIR-tool capability, CSP-restricted network APIs, and
+must return a plain JSON object. Defaults are a 5-second timeout, 64 KiB code,
+and 256 KiB input/output. The confirmation UI displays the source first.
+
+This is strong browser isolation and containment, not a guarantee against
+browser-engine exploits or CPU/memory exhaustion. Never pass secrets or
+credentials to dynamic code. Hosts that manually construct an `Agent` must
+provide a `jsSandboxRunner`, normally:
+
+```ts
+import { createOpaqueOriginJsSandbox } from "@nemoir/web-runtime";
+
+const agent = new Agent({
+  uiHost,
+  browserTools: { jsSandboxRunner: createOpaqueOriginJsSandbox() },
+});
+```
 
 ## WebLLM adapter
 

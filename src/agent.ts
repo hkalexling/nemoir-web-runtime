@@ -52,8 +52,9 @@ export interface WorkflowAgentOptions {
   /** UI host for browser-safe capabilities. Required if the workflow uses user.elicit/user.confirm. */
   uiHost?: WebUiHost;
   /**
-   * Options for browser-native tools (http.fetch, browser.storage.*, browser.js.run).
-   * Pass `jsWorkerFactory` when the workflow uses `browser.js.run`.
+   * Options for browser-native tools (http.fetch, browser.storage.*,
+   * browser.js.run, browser.js.sandbox). Pass `jsWorkerFactory` for trusted
+   * code or `jsSandboxRunner` for dynamic sandbox stages.
    */
   browserTools?: BrowserToolsOptions;
   /** Default run options (can be overridden per run). */

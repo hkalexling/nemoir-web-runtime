@@ -7,9 +7,10 @@
  *   - `browser.storage.read` / `browser.storage.write` — workflow-namespaced
  *     IndexedDB store, separate from WebLLM's model cache.
  *   - `browser.js.run` — trusted deterministic-stage-only code execution in
- *     a fresh dedicated Web Worker. The worker receives JSON input and returns
- *     a JSON result; no DOM, no ambient workflow inputs. Timeout & cancellation
- *     terminate the worker. Only literal code is accepted by the compiler.
+ *     a fresh dedicated Web Worker. Only literal author code is accepted.
+ *   - `browser.js.sandbox` — dynamic user/model code in an opaque-origin
+ *     iframe + nested Worker sandbox. It is pure computation over explicit
+ *     JSON input and requires an explicit NemoIR user-confirm policy.
  *
  * These tools follow the same contract as all NemoIR tools: they enforce
  * input validity only; authorization is owned by NemoIR policies.
@@ -17,6 +18,12 @@
 
 import type { Tool } from "./tools.js";
 import { isJsonSafeValue } from "./runtime.js";
+import {
+  type SandboxedJsRunner,
+  DEFAULT_JS_SANDBOX_MAX_CODE_BYTES,
+  utf8ByteLength,
+} from "./sandbox.js";
+import { PolicyEvaluationError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // http.fetch
@@ -297,14 +304,56 @@ async function jsRunHandler(
 }
 
 // ---------------------------------------------------------------------------
+// browser.js.sandbox (dynamic, opaque-origin execution)
+// ---------------------------------------------------------------------------
+
+async function jsSandboxHandler(
+  args: Record<string, unknown>,
+  ctx: { signal?: AbortSignal },
+  opts: {
+    readonly runner: SandboxedJsRunner;
+    readonly timeoutMs?: number;
+    readonly maxCodeBytes?: number;
+    readonly maxInputBytes?: number;
+    readonly maxOutputBytes?: number;
+  },
+): Promise<Record<string, unknown>> {
+  if (typeof args.code !== "string") {
+    throw new Error("browser.js.sandbox code must be a string");
+  }
+  return opts.runner.run({
+    code: args.code,
+    input: args.input,
+    signal: ctx.signal,
+    timeoutMs: opts.timeoutMs,
+    maxCodeBytes: opts.maxCodeBytes,
+    maxInputBytes: opts.maxInputBytes,
+    maxOutputBytes: opts.maxOutputBytes,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Tool factory
 // ---------------------------------------------------------------------------
 
 export interface BrowserToolsOptions {
-  /** Required when the workflow uses `browser.js.run`. */
+  /** Required when the workflow uses trusted `browser.js.run`. */
   readonly jsWorkerFactory?: () => Worker;
   /** Timeout for `browser.js.run` invocations. Default 30_000. */
   readonly jsRunTimeoutMs?: number;
+  /**
+   * Required when the workflow uses dynamic `browser.js.sandbox`. The standard
+   * implementation is `createOpaqueOriginJsSandbox()`.
+   */
+  readonly jsSandboxRunner?: SandboxedJsRunner;
+  /** Timeout for `browser.js.sandbox` invocations. Default 5_000. */
+  readonly jsSandboxTimeoutMs?: number;
+  /** Maximum UTF-8 source bytes accepted by `browser.js.sandbox`. */
+  readonly jsSandboxMaxCodeBytes?: number;
+  /** Maximum JSON input bytes accepted by `browser.js.sandbox`. */
+  readonly jsSandboxMaxInputBytes?: number;
+  /** Maximum JSON result bytes accepted by `browser.js.sandbox`. */
+  readonly jsSandboxMaxOutputBytes?: number;
 }
 
 /**
@@ -371,6 +420,44 @@ export function createBrowserTools(
         jsRunHandler(args, ctx, {
           jsWorkerFactory: opts.jsWorkerFactory!,
           jsRunTimeoutMs: opts.jsRunTimeoutMs,
+        }),
+    });
+  }
+
+  // browser.js.sandbox — a dynamic-code path. It is executable only from a
+  // deterministic stage, requires an explicit `before ... user.confirm`
+  // policy in the decoded web IR, and receives no direct host capabilities.
+  if (opts.jsSandboxRunner) {
+    // Resolve the effective source limit once; the same cap governs the
+    // pre-policy preflight and the runner, so a configured limit protects the
+    // confirmation UI (not just the runner execution).
+    const maxCodeBytes = opts.jsSandboxMaxCodeBytes ?? DEFAULT_JS_SANDBOX_MAX_CODE_BYTES;
+    tools.push({
+      name: "js_sandbox",
+      capability: "browser.js.sandbox",
+      description:
+        "Execute user- or model-provided JavaScript in an opaque-origin sandbox. " +
+        "The code receives JSON `input`, has no direct host-page/host-origin-storage/tool access and CSP-restricted network APIs, " +
+        "and must return a plain JSON object. Only available in deterministic (exec:) stages.",
+      inputSchema: { code: "string", input: "json" },
+      // Fail closed before before-policies render the full source into a
+      // user.confirm modal. Non-allocating to avoid copying an oversized
+      // untrusted string into an encoded buffer before rejection.
+      preflight(args: Record<string, unknown>): void {
+        if (typeof args.code !== "string") return;
+        if (utf8ByteLength(args.code) > maxCodeBytes) {
+          throw new PolicyEvaluationError(
+            `browser.js.sandbox source exceeds ${maxCodeBytes} byte limit`,
+          );
+        }
+      },
+      handler: async (args, ctx) =>
+        jsSandboxHandler(args, ctx, {
+          runner: opts.jsSandboxRunner!,
+          timeoutMs: opts.jsSandboxTimeoutMs,
+          maxCodeBytes: opts.jsSandboxMaxCodeBytes,
+          maxInputBytes: opts.jsSandboxMaxInputBytes,
+          maxOutputBytes: opts.jsSandboxMaxOutputBytes,
         }),
     });
   }

@@ -178,3 +178,18 @@ export {
   type HttpFetchResult,
   type JsRunOptions,
 } from "./browser-tools.js";
+
+// Dynamic-code sandbox
+export {
+  OpaqueOriginJsSandbox,
+  createOpaqueOriginJsSandbox,
+  DEFAULT_JS_SANDBOX_TIMEOUT_MS,
+  DEFAULT_JS_SANDBOX_MAX_CODE_BYTES,
+  DEFAULT_JS_SANDBOX_MAX_INPUT_BYTES,
+  DEFAULT_JS_SANDBOX_MAX_OUTPUT_BYTES,
+  OPAQUE_ORIGIN_SANDBOX_CSP,
+  utf8ByteLength,
+  type SandboxedJsRunner,
+  type JsSandboxRequest,
+  type OpaqueOriginJsSandboxOptions,
+} from "./sandbox.js";

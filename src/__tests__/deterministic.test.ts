@@ -165,6 +165,34 @@ describe("DeterministicStageExecutor — execute", () => {
     expect(result).toEqual({ found: true, value: "v1" });
   });
 
+  it("projects the declared write name from a sandbox-style result envelope", async () => {
+    // Dynamic code returning `{ result: { doubled: 42 } }` must populate a
+    // stage writing `result: json` — the envelope contract documented in
+    // docs/web-backend.md §9 / docs/dsl-and-ir.md.
+    const stage = makeStage("RunSandbox", {
+      writes: [makeWrite("result", "json")],
+      execution: {
+        kind: "tool",
+        capability: "browser.js.sandbox",
+        args: new Map([
+          ["code", { kind: "ref", ref: { kind: "input", name: "code" } }],
+          ["input", { kind: "literal", type: "json", value: { x: 21 } }],
+        ]),
+      },
+      requires: new Set(["browser.js.sandbox"]),
+    });
+    const executor = new DeterministicStageExecutor({
+      tools: emptyRegistry(),
+      toolForStage: new Map([["RunSandbox", "js_sandbox"]]) });
+    const ctx = makeStageContext({
+      stage,
+      inputs: { code: "return { result: { doubled: input.x * 2 } };" },
+      callTool: async () => ({ result: { doubled: 42 } }),
+    });
+    const result = await executor.execute(ctx);
+    expect(result).toEqual({ result: { doubled: 42 } });
+  });
+
   it("throws when no tool is selected for a stage", async () => {
     const stage = makeStage("Confirm", {
       execution: { kind: "tool", capability: "user.confirm", args: new Map() },
