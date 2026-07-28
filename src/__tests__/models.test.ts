@@ -179,6 +179,74 @@ describe("ModelStageExecutor — retries", () => {
     expect(calls.length).toBe(2);
   });
 
+  it("fails immediately on empty content without retrying (avoid degenerate loops)", async () => {
+    // Small local models that emit nothing on the first attempt will not recover
+    // by being told "you returned empty" — that error text is what they echo and
+    // loop on. Empty content is a provider failure, not a correctable schema
+    // error, so it must not consume the retry budget.
+    const { adapter, calls } = fakeAdapter([
+      { content: "" },
+      { content: "{\"summary\":\"would-not-be-reached\"}" },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+      options: { maxModelRetries: 3 },
+    });
+    await expect(executor.execute(ctx)).rejects.toThrow(/empty content/);
+    // Only the first (failed) call ran — no retry.
+    expect(calls.length).toBe(1);
+  });
+
+  it("uses a concrete output contract when a context field leaks into output", async () => {
+    const { adapter, calls } = fakeAdapter([
+      {
+        content: '{"mode":"hint","hintLevel":"targeted","concept":"complexity","next_steps":["discuss complexity"]}',
+      },
+      {
+        content: '{"mode":"hint","hint":"Which earlier value complements this number?","concept":"complement lookup"}',
+      },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+    });
+    const ctx = makeCtx({
+      writes: [
+        { name: "mode", type: "string", optional: true },
+        { name: "hint", type: "string" },
+        { name: "concept", type: "string" },
+        { name: "next_steps", type: "string[]", optional: true },
+      ],
+      readableContext: { hintLevel: "targeted" },
+    });
+
+    await expect(executor.execute(ctx)).resolves.toEqual({
+      mode: "hint",
+      hint: "Which earlier value complements this number?",
+      concept: "complement lookup",
+      next_steps: null,
+    });
+    expect(calls).toHaveLength(2);
+
+    const initial = calls[0]?.messages.at(-1) as { content?: string } | undefined;
+    expect(initial?.content).toContain('The ONLY allowed output keys at the top level are: "mode", "hint", "concept", "next_steps".');
+    expect(initial?.content).not.toContain('"properties"');
+    expect(initial?.content).not.toContain('"required"');
+
+    const retry = calls[1]?.messages.at(-1) as { content?: string } | undefined;
+    expect(retry?.content).toContain("unknown output field 'hintLevel'");
+    expect(retry?.content).toContain('Required keys: "hint", "concept".');
+    expect(retry?.content).toContain("do not repeat its shape");
+    expect(retry?.content).not.toContain('"properties"');
+    expect(retry?.content).not.toContain('"required"');
+  });
+
   it("exhausts maxModelRetries and raises", async () => {
     const { adapter, calls } = fakeAdapter([
       { content: "not json" },
@@ -213,6 +281,81 @@ describe("ModelStageExecutor — retries", () => {
     });
     await expect(executor.execute(ctx)).rejects.toThrow(ModelOutputValidationError);
     expect(calls.length).toBe(1);
+  });
+
+  it("retries semantic output-validator errors and feeds corrections to the model", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: '{"summary":"this response is deliberately too verbose"}' },
+      { content: '{"summary":"concise"}' },
+    ]);
+    const collected: import("../events.js").WorkflowEvent[] = [];
+    const emitter = new WorkflowEventEmitter("semantic-retry", async (event) => {
+      collected.push(event);
+    });
+    const validatorCalls: Array<Record<string, unknown>> = [];
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+      modelOutputValidators: {
+        Test: (output, context) => {
+          validatorCalls.push({
+            ...output,
+            stageId: context.stageId,
+            readableValue: context.readableContext.value,
+          });
+          return typeof output.summary === "string" && output.summary.length > 12
+            ? ["summary must be at most 12 characters"]
+            : null;
+        },
+      },
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+      readableContext: { value: "context-visible-to-validator" },
+      emitter,
+    });
+
+    await expect(executor.execute(ctx)).resolves.toEqual({ summary: "concise" });
+    expect(calls).toHaveLength(2);
+    expect(validatorCalls).toEqual([
+      {
+        summary: "this response is deliberately too verbose",
+        stageId: "Test",
+        readableValue: "context-visible-to-validator",
+      },
+      {
+        summary: "concise",
+        stageId: "Test",
+        readableValue: "context-visible-to-validator",
+      },
+    ]);
+    const retry = collected.find((event) => event.kind === "model_retry");
+    expect(retry?.metadata?.category).toBe("semantic_output");
+    const retryMessage = calls[1]?.messages.at(-1) as { content?: string } | undefined;
+    expect(retryMessage?.content).toContain("summary must be at most 12 characters");
+  });
+
+  it("exhausts maxModelRetries for repeated semantic output-validator errors", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: '{"summary":"invalid"}' },
+      { content: '{"summary":"still invalid"}' },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+      modelOutputValidators: {
+        Test: () => "summary must be acceptable",
+      },
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+      options: { maxModelRetries: 1 },
+    });
+
+    await expect(executor.execute(ctx)).rejects.toThrow(/semantic output validation/i);
+    expect(calls).toHaveLength(2);
   });
 });
 
@@ -461,10 +604,9 @@ describe("ModelStageExecutor — cancellation", () => {
 // ---------------------------------------------------------------------------
 
 describe("ModelStageExecutor — tagged-envelope hardening", () => {
-  it("retries on a malformed envelope (missing kind)", async () => {
+  it("accepts direct JSON output when a tagged stage has no callable tools", async () => {
     const { adapter, calls } = fakeAdapter([
-      { content: JSON.stringify({ summary: "no envelope wrapper" }) },
-      { content: JSON.stringify({ kind: "final", output: { summary: "done" } }) },
+      { content: JSON.stringify({ summary: "done" }) },
     ]);
     const executor = new ModelStageExecutor({
       model: adapter,
@@ -477,7 +619,46 @@ describe("ModelStageExecutor — tagged-envelope hardening", () => {
     });
     const result = await executor.execute(ctx);
     expect(result).toEqual({ summary: "done" });
+    expect(calls.length).toBe(1);
+  });
+
+  it("keeps tagged envelopes strict when a stage can call tools", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: JSON.stringify({ summary: "no envelope wrapper" }) },
+      { content: JSON.stringify({ kind: "final", output: { summary: "done" } }) },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([readTool()]),
+      maxToolRounds: 32,
+      actionProtocol: "tagged_envelope",
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+      allowedCapabilities: new Set(["user.elicit"]),
+    });
+    const result = await executor.execute(ctx);
+    expect(result).toEqual({ summary: "done" });
     expect(calls.length).toBe(2);
+  });
+
+  it("uses a direct-JSON prompt for a tagged stage with no tools", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: JSON.stringify({ summary: "done" }) },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+      actionProtocol: "tagged_envelope",
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+    });
+    await executor.execute(ctx);
+    const system = calls[0]?.messages[0] as { content: string };
+    expect(system.content).toContain("direct JSON object");
+    expect(system.content).not.toContain("When you want to call a tool");
   });
 
   it("extracts the envelope after thinking reasoning that quotes a JSON-like value (thinking-model behavior)", async () => {
@@ -547,6 +728,45 @@ describe("ModelStageExecutor — tagged-envelope hardening", () => {
     expect(systemMsg.content).toContain("elicit");
     expect(systemMsg.content).toContain("tool_call");
     expect(systemMsg.content).toContain("final");
+  });
+
+  it("repairs missing commas between properties and array elements (small-model JSON)", async () => {
+    // TinyLlama-style JSON that drops commas after object property values and
+    // between string array elements. This is the most common structural failure
+    // for small local models producing stage output.
+    const content =
+      "{\n" +
+      "  \"mode\": \"hint\",\n" +
+      "  \"hint\": \"Check the empty array case.\",\n" +
+      "  \"concept\": \"edge cases\"\n\n" +
+      "  \"next_steps\": [\n" +
+      "    \"Think about the zero-length input.\"\n" +
+      "    \"Add a guard clause.\"\n" +
+      "  ]\n" +
+      "}";
+    const { adapter, calls } = fakeAdapter([{ content }]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+      actionProtocol: "tagged_envelope",
+    });
+    const ctx = makeCtx({
+      writes: [
+        { name: "mode", type: "string" },
+        { name: "hint", type: "string" },
+        { name: "concept", type: "string" },
+        { name: "next_steps", type: "string[]" },
+      ],
+    });
+    const result = await executor.execute(ctx);
+    expect(result).toEqual({
+      mode: "hint",
+      hint: "Check the empty array case.",
+      concept: "edge cases",
+      next_steps: ["Think about the zero-length input.", "Add a guard clause."],
+    });
+    expect(calls.length).toBe(1);
   });
 
   it("feeds tool results back as user messages (not role:tool)", async () => {

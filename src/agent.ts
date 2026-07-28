@@ -263,6 +263,7 @@ export class WorkflowAgent {
           tools: this.tools,
           maxToolRounds,
           actionProtocol: this.actionProtocol ?? "native",
+          modelOutputValidators: resolvedOptions?.modelOutputValidators,
         })
       : null;
 

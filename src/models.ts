@@ -27,6 +27,7 @@
 import { WRITE_TYPE_TO_JSON, getCapability } from "./capabilities.js";
 import {
   ModelOutputValidationError,
+  ModelProviderError,
   PolicyDeniedError,
   ToolInvocationError,
 } from "./errors.js";
@@ -47,6 +48,7 @@ import {
   type StageExecutor,
 } from "./runtime.js";
 import type { WriteSpec } from "./manifest.js";
+import type { ModelStageOutputValidators } from "./runtime-types.js";
 import type { Tool, ToolParamType } from "./tools.js";
 import type { WorkflowEventEmitter } from "./events.js";
 
@@ -337,31 +339,110 @@ export function normalizeToolArgs(
 
 const INVALID_CONTENT_PREVIEW_MAX = 500;
 
+interface OutputContractField {
+  readonly name: string;
+  readonly required: boolean;
+  readonly schema: Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function outputContractFields(
+  outputSchema: Record<string, unknown>,
+): readonly OutputContractField[] {
+  const rawProperties = isRecord(outputSchema.properties)
+    ? outputSchema.properties
+    : {};
+  const required = new Set(
+    Array.isArray(outputSchema.required)
+      ? outputSchema.required.filter((name): name is string => typeof name === "string")
+      : [],
+  );
+
+  return Object.entries(rawProperties).map(([name, schema]) => ({
+    name,
+    required: required.has(name),
+    schema: isRecord(schema) ? schema : {},
+  }));
+}
+
+function exampleValueForOutputField(schema: Record<string, unknown>): unknown {
+  switch (schema.type) {
+    case "string":
+      return "your answer";
+    case "boolean":
+      return false;
+    case "number":
+      return 0;
+    case "array":
+      return ["your first item"];
+    default:
+      return null;
+  }
+}
+
+/**
+ * Explain output shape in concrete language instead of presenting a raw JSON
+ * Schema document. Small local models regularly echo JSON Schema metadata
+ * (`type`, `properties`, `required`) as if it were their answer.
+ */
+function outputContractText(
+  outputSchema: Record<string, unknown>,
+  useTaggedEnvelope: boolean,
+): string {
+  const fields = outputContractFields(outputSchema);
+  const destination = useTaggedEnvelope
+    ? 'inside the final envelope\'s "output" object'
+    : "at the top level";
+
+  if (fields.length === 0) {
+    return `Return an empty JSON object ${destination}.`;
+  }
+
+  const required = fields.filter((field) => field.required).map((field) => field.name);
+  const optional = fields.filter((field) => !field.required).map((field) => field.name);
+  const example = Object.fromEntries(
+    fields.map((field) => [field.name, exampleValueForOutputField(field.schema)]),
+  );
+  const quoteKeys = (keys: readonly string[]) => keys.map((key) => `"${key}"`).join(", ");
+
+  const lines = [
+    `The ONLY allowed output keys ${destination} are: ${quoteKeys(fields.map((field) => field.name))}.`,
+  ];
+  if (required.length > 0) lines.push(`Required keys: ${quoteKeys(required)}.`);
+  if (optional.length > 0) lines.push(`Optional keys: ${quoteKeys(optional)}.`);
+  lines.push(
+    `Use actual answer values. Do NOT output a JSON Schema, type definitions, placeholders, or field names copied from the readable context.`,
+  );
+  lines.push(`Concrete JSON shape (replace every example value): ${JSON.stringify(example)}`);
+  return lines.join("\n");
+}
+
 function stageRetryMessage(
   stageId: string,
   errorMsg: string,
   outputSchema: Record<string, unknown>,
-  protocol: ActionProtocol,
+  useTaggedEnvelope: boolean,
   invalidContent?: string | null,
 ): Record<string, unknown> {
   let content =
     `The previous response for stage '${stageId}' was invalid. Correct the errors and retry.\n\n` +
-    `Error:\n${errorMsg}\n\n`;
-  if (protocol === "tagged_envelope") {
+    `Error:\n${errorMsg}\n\n` +
+    `Output contract:\n${outputContractText(outputSchema, useTaggedEnvelope)}\n\n`;
+  if (useTaggedEnvelope) {
     content +=
-      `Respond with {"kind":"final","output":{...}} where "output" matches this schema exactly:\n` +
-      JSON.stringify(outputSchema, null, 2);
+      `Reply with ONLY {"kind":"final","output":{...}}. Apply the output contract only inside "output".\n`;
   } else {
-    content +=
-      `Return only a JSON object matching this schema:\n` +
-      JSON.stringify(outputSchema, null, 2);
+    content += "Reply with ONLY one direct JSON object that follows the output contract.\n";
   }
   if (invalidContent) {
     const preview =
       invalidContent.length > INVALID_CONTENT_PREVIEW_MAX
         ? invalidContent.slice(0, INVALID_CONTENT_PREVIEW_MAX)
         : invalidContent;
-    content += `\n\nYour previous output was:\n${preview}`;
+    content += `\nYour previous output was invalid; do not repeat its shape:\n${preview}`;
   }
   return { role: "user", content };
 }
@@ -443,20 +524,196 @@ function extractFirstJsonObject(content: string): string | null {
   return null;
 }
 
+/**
+ * Tolerantly extract the first balanced JSON object without requiring a
+ * tagged-envelope key. Used only for model stages with no callable tools,
+ * where a direct JSON object is unambiguous and avoids imposing envelope
+ * syntax on smaller local models.
+ */
+function extractFirstPlainJsonObject(content: string): string | null {
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  let start = -1;
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (inStr) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+    } else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      if (depth === 0) continue;
+      depth--;
+      if (depth === 0 && start !== -1) {
+        return content.slice(start, i + 1);
+      }
+    }
+  }
+  if (depth > 0 && start !== -1) {
+    let fixup = content.slice(start);
+    if (inStr) fixup += '"';
+    fixup += "}".repeat(depth);
+    return fixup;
+  }
+  return null;
+}
+
+/**
+ * Parse model JSON, tolerant of the missing commas that small local models
+ * routinely drop between object properties and array elements. Strict parse
+ * is attempted first; only if it fails is the repair pass applied, so valid
+ * JSON is never altered.
+ */
+function parseJsonTolerantly(json: string, stageId: string): unknown {
+  try {
+    return JSON.parse(json);
+  } catch (firstError) {
+    try {
+      return JSON.parse(repairMissingCommas(json));
+    } catch {
+      throw new ModelOutputValidationError(
+        `model returned invalid JSON in stage '${stageId}': ${firstError instanceof Error ? firstError.message : String(firstError)}`,
+      );
+    }
+  }
+}
+
+/**
+ * Insert commas that small models omit between JSON values. The scanner
+ * walks the input tracking string state; when a value ends (a closing
+ * string quote, a closing `}`/`]`, or the end of a number/keyword token)
+ * and the next non-whitespace token starts a new value (`"`, `{`, `[`, a
+ * digit, or `true`/`false`/`null`) without an intervening `,`, one is
+ * inserted. Object keys are never modified because a closing quote
+ * immediately followed by `:` is recognised as a key, not a value.
+ */
+function repairMissingCommas(json: string): string {
+  const out: string[] = [];
+  let i = 0;
+  let inString = false;
+  let escape = false;
+
+  function nextNonWhitespace(from: number): string | undefined {
+    let j = from;
+    while (j < json.length && /\s/.test(json[j] ?? "")) j++;
+    return json[j];
+  }
+
+  function maybeInsertComma(afterIndex: number): void {
+    const next = nextNonWhitespace(afterIndex);
+    // No comma needed when the next token is a structural closer, a colon
+    // (meaning the string we just closed was an object key), or the user
+    // already placed a comma.
+    if (
+      next === undefined ||
+      next === "," ||
+      next === "}" ||
+      next === "]" ||
+      next === ":"
+    ) {
+      return;
+    }
+    out.push(",");
+  }
+
+  while (i < json.length) {
+    const ch = json[i] ?? "";
+
+    if (inString) {
+      out.push(ch);
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+        maybeInsertComma(i + 1);
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      out.push(ch);
+      i++;
+      continue;
+    }
+
+    if (ch === "}" || ch === "]") {
+      out.push(ch);
+      maybeInsertComma(i + 1);
+      i++;
+      continue;
+    }
+
+    // Numbers and JSON keywords (true, false, null) are bare value tokens.
+    if (/[0-9\-]/.test(ch) || ch === "t" || ch === "f" || ch === "n") {
+      const start = i;
+      if (ch === "t" || ch === "f" || ch === "n") {
+        while (i < json.length && /[a-z]/.test(json[i] ?? "")) i++;
+      } else {
+        while (i < json.length && /[0-9.\-+eE]/.test(json[i] ?? "")) i++;
+      }
+      out.push(json.slice(start, i));
+      maybeInsertComma(i);
+      continue;
+    }
+
+    out.push(ch);
+    i++;
+  }
+
+  return out.join("");
+}
+
+function parsePlainStageOutput(content: string, stageId: string): Record<string, unknown> {
+  const json = extractFirstPlainJsonObject(content) ?? content;
+  const parsed = parseJsonTolerantly(json, stageId);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ModelOutputValidationError(
+      `model returned ${typeof parsed} instead of object in stage '${stageId}'`,
+    );
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  // Continue to accept a correctly tagged final envelope for backward
+  // compatibility when the stage itself has no tools.
+  if (obj.kind === "final") {
+    const output = obj.output;
+    if (typeof output !== "object" || output === null || Array.isArray(output)) {
+      throw new ModelOutputValidationError(
+        `tagged envelope 'final' output must be an object in stage '${stageId}'`,
+      );
+    }
+    return output as Record<string, unknown>;
+  }
+  if ("kind" in obj) {
+    throw new ModelOutputValidationError(
+      `model returned tagged action '${String(obj.kind)}' in tool-less stage '${stageId}'; expected a final JSON object`,
+    );
+  }
+  return obj;
+}
+
 function parseTaggedEnvelope(content: string, stageId: string): StageAction {
   // Small models often emit the envelope followed by trailing prose or a
   // duplicate JSON block. Try strict parse first; if it fails, attempt to
   // extract the first balanced JSON object starting at the first '{' that
   // carries a "kind" field.
-  let parsed: unknown;
   const json = extractFirstJsonObject(content) ?? content;
-  try {
-    parsed = JSON.parse(json);
-  } catch (e) {
-    throw new ModelOutputValidationError(
-      `model returned invalid JSON in stage '${stageId}': ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
+  const parsed = parseJsonTolerantly(json, stageId);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new ModelOutputValidationError(
       `model returned ${typeof parsed} instead of object in stage '${stageId}'`,
@@ -502,17 +759,20 @@ export class ModelStageExecutor implements StageExecutor {
   private readonly tools: import("./tools.js").ToolRegistry;
   private readonly maxToolRounds: number | null;
   private readonly actionProtocol: ActionProtocol;
+  private readonly modelOutputValidators?: ModelStageOutputValidators;
 
   constructor(opts: {
     model: ModelAdapter | ModelRouter;
     tools: import("./tools.js").ToolRegistry;
     maxToolRounds?: number | null;
     actionProtocol?: ActionProtocol;
+    modelOutputValidators?: ModelStageOutputValidators;
   }) {
     this.model = opts.model;
     this.tools = opts.tools;
     this.maxToolRounds = opts.maxToolRounds ?? 32;
     this.actionProtocol = opts.actionProtocol ?? "native";
+    this.modelOutputValidators = opts.modelOutputValidators;
   }
 
   async execute(ctx: StageContext): Promise<Record<string, unknown>> {
@@ -538,13 +798,17 @@ export class ModelStageExecutor implements StageExecutor {
       },
     }));
 
-    // Determine the action protocol (set at constructor time)
+    // Tagged envelopes are needed only for stages that can call tools. For a
+    // tool-less stage, a direct JSON object is unambiguous and substantially
+    // more reliable for small local WebLLM models.
     const protocol: ActionProtocol = this.actionProtocol;
+    const useTaggedEnvelope =
+      protocol === "tagged_envelope" && stageTools.length > 0;
 
     const messages: Record<string, unknown>[] = this.buildInitialMessages(
       ctx,
       outputSchema,
-      protocol,
+      useTaggedEnvelope,
       stageTools,
     );
 
@@ -582,7 +846,7 @@ export class ModelStageExecutor implements StageExecutor {
           retryCount++;
           await this.emitModelRetry(emitter, ctx.stage.id, String(e), "tool_call_parse", retryCount, maxRetries);
           messages.push(
-            stageRetryMessage(ctx.stage.id, String(e), outputSchema, protocol),
+            stageRetryMessage(ctx.stage.id, String(e), outputSchema, useTaggedEnvelope),
           );
           continue;
         }
@@ -646,23 +910,21 @@ export class ModelStageExecutor implements StageExecutor {
       }
 
       // --- Final output (content-only response) ---
+      // Empty content is a provider-level failure, not a correctable schema
+      // error. Retrying it sends the error text back to the model, which small
+      // local models echo or loop on degenerately. Fail the run immediately.
       if (!response.content) {
-        const e = new ModelOutputValidationError(
+        throw new ModelProviderError(
           `model returned empty content in stage '${ctx.stage.id}'`,
         );
-        if (retryCount >= maxRetries) throw e;
-        retryCount++;
-        await this.emitModelRetry(emitter, ctx.stage.id, String(e), "stage_output", retryCount, maxRetries);
-        messages.push(stageRetryMessage(ctx.stage.id, String(e), outputSchema, protocol));
-        continue;
       }
 
       let parsed: unknown;
-      // For the tagged-envelope protocol, route through parseTaggedEnvelope
-      // first, because it tolerantly extracts the envelope from content that
-      // may contain trailing prose / duplicate JSON blocks (common with small
-      // local models).
-      if (protocol === "tagged_envelope") {
+      // Tool-enabled tagged stages retain the explicit action envelope so a
+      // model can unambiguously request a tool. Tool-less stages instead use
+      // a direct JSON object: there is no possible tool-call branch, and this
+      // avoids an unnecessary format burden for small local models.
+      if (useTaggedEnvelope) {
         let action: StageAction;
         try {
           action = parseTaggedEnvelope(response.content, ctx.stage.id);
@@ -671,7 +933,7 @@ export class ModelStageExecutor implements StageExecutor {
             if (retryCount >= maxRetries) throw e;
             retryCount++;
             await this.emitModelRetry(emitter, ctx.stage.id, String(e), "stage_output", retryCount, maxRetries);
-            messages.push(stageRetryMessage(ctx.stage.id, String(e), outputSchema, protocol, response.content));
+            messages.push(stageRetryMessage(ctx.stage.id, String(e), outputSchema, useTaggedEnvelope, response.content));
             continue;
           }
           throw e;
@@ -729,19 +991,20 @@ export class ModelStageExecutor implements StageExecutor {
           }
           continue;
         }
-        // kind === "final": use action.output as the parsed output
+        // kind === "final": use action.output as the parsed output.
         parsed = action.output;
       } else {
         try {
-          parsed = JSON.parse(response.content);
+          parsed = parsePlainStageOutput(response.content, ctx.stage.id);
         } catch (e) {
-          const msg = `model returned invalid JSON in stage '${ctx.stage.id}': ${e instanceof Error ? e.message : String(e)}`;
-          const err = new ModelOutputValidationError(msg);
-          if (retryCount >= maxRetries) throw err;
-          retryCount++;
-          await this.emitModelRetry(emitter, ctx.stage.id, msg, "stage_output", retryCount, maxRetries);
-          messages.push(stageRetryMessage(ctx.stage.id, msg, outputSchema, protocol, response.content));
-          continue;
+          if (e instanceof ModelOutputValidationError) {
+            if (retryCount >= maxRetries) throw e;
+            retryCount++;
+            await this.emitModelRetry(emitter, ctx.stage.id, String(e), "stage_output", retryCount, maxRetries);
+            messages.push(stageRetryMessage(ctx.stage.id, String(e), outputSchema, useTaggedEnvelope, response.content));
+            continue;
+          }
+          throw e;
         }
       }
 
@@ -751,19 +1014,46 @@ export class ModelStageExecutor implements StageExecutor {
         if (retryCount >= maxRetries) throw err;
         retryCount++;
         await this.emitModelRetry(emitter, ctx.stage.id, msg, "stage_output", retryCount, maxRetries);
-        messages.push(stageRetryMessage(ctx.stage.id, msg, outputSchema, protocol, response.content));
+        messages.push(stageRetryMessage(ctx.stage.id, msg, outputSchema, useTaggedEnvelope, response.content));
         continue;
       }
 
       try {
-        return normalizeStageOutput(ctx.stage, parsed as Record<string, unknown>);
+        const normalized = normalizeStageOutput(ctx.stage, parsed as Record<string, unknown>);
+        const semanticError = await this.semanticValidationError(ctx, normalized);
+        if (semanticError) {
+          const err = new ModelOutputValidationError(
+            `semantic output validation failed in stage '${ctx.stage.id}': ${semanticError}`,
+          );
+          if (retryCount >= maxRetries) throw err;
+          retryCount++;
+          await this.emitModelRetry(
+            emitter,
+            ctx.stage.id,
+            String(err),
+            "semantic_output",
+            retryCount,
+            maxRetries,
+          );
+          messages.push(
+            stageRetryMessage(
+              ctx.stage.id,
+              String(err),
+              outputSchema,
+              useTaggedEnvelope,
+              response.content,
+            ),
+          );
+          continue;
+        }
+        return normalized;
       } catch (e) {
         if (e instanceof ModelOutputValidationError) {
           if (retryCount >= maxRetries) throw e;
           retryCount++;
           await this.emitModelRetry(emitter, ctx.stage.id, String(e), "stage_output", retryCount, maxRetries);
           messages.push(
-            stageRetryMessage(ctx.stage.id, String(e), outputSchema, protocol, response.content),
+            stageRetryMessage(ctx.stage.id, String(e), outputSchema, useTaggedEnvelope, response.content),
           );
           continue;
         }
@@ -772,10 +1062,37 @@ export class ModelStageExecutor implements StageExecutor {
     }
   }
 
+  /**
+   * Run an optional consumer-provided semantic validator after the model
+   * output has passed the stage's structural schema checks. Returning an
+   * error string here causes the caller's existing model retry loop to feed
+   * that correction back to the model.
+   */
+  private async semanticValidationError(
+    ctx: StageContext,
+    output: Readonly<Record<string, unknown>>,
+  ): Promise<string | null> {
+    const validator = this.modelOutputValidators?.[ctx.stage.id];
+    if (!validator) return null;
+
+    const result = await validator(output, {
+      stageId: ctx.stage.id,
+      inputs: ctx.inputs,
+      readableContext: ctx.readableContext,
+    });
+    if (result === null || result === undefined) return null;
+
+    const errors = (typeof result === "string" ? [result] : result)
+      .filter((error): error is string => typeof error === "string")
+      .map((error) => error.trim())
+      .filter(Boolean);
+    return errors.length > 0 ? errors.join("; ") : null;
+  }
+
   private buildInitialMessages(
     ctx: StageContext,
     outputSchema: Record<string, unknown>,
-    protocol: ActionProtocol,
+    useTaggedEnvelope: boolean,
     stageTools: readonly Tool[],
   ): Record<string, unknown>[] {
     let systemContent =
@@ -783,7 +1100,7 @@ export class ModelStageExecutor implements StageExecutor {
       "Use only the supplied tools when needed. " +
       "Do not expose hidden chain-of-thought.";
 
-    if (protocol === "tagged_envelope") {
+    if (useTaggedEnvelope) {
       systemContent +=
         "\n\nYou communicate using a tagged JSON envelope. The 'output' field of the final envelope must contain the actual values for the stage output (NOT the schema itself).\n" +
         "When you want to call a tool, respond with ONLY: " +
@@ -799,13 +1116,13 @@ export class ModelStageExecutor implements StageExecutor {
         "Available tools:\n" + toolsToPromptText(stageTools);
     } else {
       systemContent +=
-        " Return only JSON matching the required output schema when the stage is complete.";
+        "\n\nNo callable tools are available for this stage. Respond with ONLY a direct JSON object matching the required output schema. Do not use a {\"kind\":...,\"output\":...} envelope and do not include prose outside the JSON object.";
     }
 
-    const finalInstruction =
-      protocol === "tagged_envelope"
-        ? "When complete, respond with {\"kind\":\"final\",\"output\":{...}} where 'output' matches this schema:\n"
-        : "When complete, respond with a JSON object matching this schema:\n";
+    const finalInstruction = useTaggedEnvelope
+      ? "When complete, respond with ONLY {\"kind\":\"final\",\"output\":{...}}.\n"
+      : "When complete, respond with ONLY one direct JSON object.\n";
+    const outputContract = outputContractText(outputSchema, useTaggedEnvelope);
 
     const userContent =
       `Workflow: ${ctx.workflowId}\n` +
@@ -814,7 +1131,7 @@ export class ModelStageExecutor implements StageExecutor {
       `Readable context:\n${JSON.stringify(ctx.readableContext, null, 2)}\n\n` +
       `Allowed capabilities:\n${JSON.stringify([...ctx.allowedCapabilities])}\n\n` +
       finalInstruction +
-      JSON.stringify(outputSchema, null, 2);
+      `Output contract (separate from readable context):\n${outputContract}`;
 
     return [
       { role: "system", content: systemContent },

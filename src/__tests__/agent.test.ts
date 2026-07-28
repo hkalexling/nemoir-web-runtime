@@ -136,6 +136,35 @@ describe("WorkflowAgent — basic run", () => {
     expect(events[0].kind).toBe("run_started");
     expect(events[events.length - 1].kind).toBe("run_completed");
   });
+
+  it("forwards per-run semantic model-output validators into retry handling", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: '{"summary": "first"}' },
+      { content: '{"result": "too long"}' },
+      { content: '{"result": "fixed"}' },
+    ]);
+    const agent = new WorkflowAgent(simpleIr, { modelAdapter: adapter });
+
+    const result = await agent.run({ task: "hello" }, {
+      options: {
+        modelOutputValidators: {
+          Second: (output, context) => {
+            expect(context.stageId).toBe("Second");
+            return output.result === "too long"
+              ? "result must be shorter"
+              : null;
+          },
+        },
+      },
+    });
+
+    expect(result.output).toEqual({ result: "fixed" });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.messages.at(-1)).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("result must be shorter"),
+    });
+  });
 });
 
 describe("WorkflowAgent — UI host", () => {
@@ -331,7 +360,7 @@ describe("WorkflowAgent — actionProtocol", () => {
     expect(systemMsg.content).not.toContain("tagged envelope");
   });
 
-  it("threads tagged_envelope through to the executor", async () => {
+  it("uses direct JSON for a tool-less tagged_envelope stage", async () => {
     const { adapter, calls } = fakeAdapter([
       { content: JSON.stringify({ kind: "final", output: { summary: "first" } }) },
       { content: JSON.stringify({ kind: "final", output: { result: "done" } }) },
@@ -343,6 +372,7 @@ describe("WorkflowAgent — actionProtocol", () => {
     const result = await agent.run({ task: "hello" });
     expect(result.output).toEqual({ result: "done" });
     const systemMsg = calls[0].messages[0] as { content: string };
-    expect(systemMsg.content).toContain("tagged JSON envelope");
+    expect(systemMsg.content).toContain("direct JSON object");
+    expect(systemMsg.content).not.toContain("When you want to call a tool");
   });
 });

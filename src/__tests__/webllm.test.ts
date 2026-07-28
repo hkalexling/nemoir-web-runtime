@@ -178,6 +178,147 @@ describe("WebLLM adapter — cancellation", () => {
   });
 });
 
+describe("WebLLM adapter — generation bounds", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("applies a default max_tokens cap when the caller does not supply one", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [
+          { choices: [{ delta: { content: "{\"summary\":\"ok\"}" } }] } as unknown as ChatCompletionChunk,
+        ],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {},
+    });
+    expect((calls[0] as { max_tokens: number }).max_tokens).toBe(1024);
+  });
+
+  it("respects an explicit max_tokens override", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [
+          { choices: [{ delta: { content: "ok" } }] } as unknown as ChatCompletionChunk,
+        ],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: { max_tokens: 16 } as Record<string, unknown>,
+    });
+    expect((calls[0] as { max_tokens: number }).max_tokens).toBe(16);
+  });
+
+  it("aborts a degenerate token loop and interrupts the engine", async () => {
+    let interruptedCount = 0;
+    // The model locks into an endless ```\n cycle (the exact failure seen
+    // in live traces). The fake engine streams 200 of these without stopping.
+    const loop: ChatCompletionChunk[] = [];
+    for (let i = 0; i < 200; i++) {
+      loop.push(
+        { choices: [{ delta: { content: i % 2 === 0 ? "```" : "`\n" } }] } as unknown as ChatCompletionChunk,
+      );
+    }
+    const { engine } = makeFakeEngine({
+      chunksPerCall: [loop],
+      interrupted: () => {
+        interruptedCount++;
+      },
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+
+    let deltaCount = 0;
+    for await (const chunk of session.adapter.stream!({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {},
+    })) {
+      if (chunk.kind === "delta") deltaCount++;
+    }
+    // The guard fires well before the full 200-chunk loop streams out.
+    expect(deltaCount).toBeLessThan(200);
+    expect(interruptedCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("aborts a phrase-level repetition loop whose deltas differ", async () => {
+    let interruptedCount = 0;
+    // Live-trace failure: the model re-emits a multi-token error phrase over
+    // and over. Individual deltas differ, so a per-delta guard misses it, but
+    // the accumulated content converges to a repeating block.
+    const phrase = "model returned empty content in Stage 'Diag needs to be valid.\nError: ";
+    const phraseDeltas = phrase.split(/(?<=\s)/).filter(Boolean);
+    const loop: ChatCompletionChunk[] = [];
+    for (let i = 0; i < 40; i++) {
+      for (const d of phraseDeltas) {
+        loop.push(
+          { choices: [{ delta: { content: d } }] } as unknown as ChatCompletionChunk,
+        );
+      }
+    }
+    const { engine } = makeFakeEngine({
+      chunksPerCall: [loop],
+      interrupted: () => {
+        interruptedCount++;
+      },
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+
+    let deltaCount = 0;
+    for await (const chunk of session.adapter.stream!({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {},
+    })) {
+      if (chunk.kind === "delta") deltaCount++;
+    }
+    const totalStreamed = phraseDeltas.length * 40;
+    expect(deltaCount).toBeLessThan(totalStreamed);
+    expect(interruptedCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sets frequency/presence penalties by default to discourage repetition", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [
+          { choices: [{ delta: { content: "ok" } }] } as unknown as ChatCompletionChunk,
+        ],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {},
+    });
+    expect((calls[0] as { frequency_penalty: number }).frequency_penalty).toBe(0.5);
+    expect((calls[0] as { presence_penalty: number }).presence_penalty).toBe(0.5);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Storage assessment (Phase 5)
 // ---------------------------------------------------------------------------
@@ -298,5 +439,121 @@ describe("WebLLM session — storage assessment", () => {
     const a = await session.assessStorage(modelId);
     expect(a.isCached).toBe(true);
     expect(a.likelySufficient).toBe(true);
+  });
+});
+
+describe("classifyLoadError", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("classifies weight-shard fetch failures by URL", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new Error("Cannot fetch https://huggingface.co/mlc-ai/m/resolve/main/params_shard_3.bin err= NetworkError: Cache.add() encountered a network error"));
+    expect(f.phase).toBe("weight_shard");
+    expect(f.failedUrl).toContain("params_shard_3.bin");
+    expect(f.suggestsCorruptCache).toBe(true);
+  });
+
+  it("classifies wasm-library failures", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new Error("Cannot fetch https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/v0_2_84/base/Qwen3.5-2B-q4f16_1_cs1k-webgpu.wasm"));
+    expect(f.phase).toBe("wasm_library");
+    expect(f.failedUrl).toContain(".wasm");
+  });
+
+  it("classifies config/tokenizer failures", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new Error("ArtifactCache failed to fetch: https://huggingface.co/mlc-ai/m/resolve/main/mlc-chat-config.json"));
+    expect(f.phase).toBe("config_or_tokenizer");
+  });
+
+  it("classifies JSON parse / cache corruption (SyntaxError)", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new SyntaxError("Unexpected end of JSON input"));
+    expect(f.phase).toBe("cache_corruption");
+    expect(f.suggestsCorruptCache).toBe(true);
+  });
+
+  it("classifies WebGPU init failures", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new Error("WebGPU: Device was lost. Insufficient memory."));
+    expect(f.phase).toBe("webgpu_init");
+  });
+
+  it("classifies generic network errors", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const f = classifyLoadError("m1", new TypeError("network error"));
+    expect(f.phase).toBe("network");
+  });
+
+  it("caps over-long error messages", async () => {
+    const { classifyLoadError } = await import("../webllm.js");
+    const long = "x".repeat(8000);
+    const f = classifyLoadError("m1", new Error(long));
+    expect(f.message.length).toBeLessThanOrEqual(5001);
+    expect(f.message.endsWith("…")).toBe(true);
+  });
+});
+
+describe("WebLLM retryLoad", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("deletes cached artifacts then reloads on retryCleanDownload", async () => {
+    let reloads = 0;
+    let deleted = 0;
+    vi.doMock("@mlc-ai/web-llm", () => ({
+      CreateWebWorkerMLCEngine: async () => ({
+        reload: async () => { reloads++; },
+        unload: async () => {},
+      }),
+      prebuiltAppConfig: {
+        model_list: [
+          { model_id: "M1-q4f16_1-MLC", vram_required_MB: 500, low_resource_required: true },
+        ],
+      },
+      functionCallingModelIds: [],
+      hasModelInCache: async (_id: string) => false,
+      deleteModelAllInfoInCache: async (_id: string) => { deleted++; },
+    }));
+    const { createWebllmSession } = await import("../webllm.js");
+    const session = await createWebllmSession({
+      workerFactory: () => ({ terminate() {}, postMessage() {} } as unknown as Worker),
+    });
+    // Ensure loaded first so a fresh worker is not incidentally recreated.
+    await session.ensureLoaded("M1-q4f16_1-MLC");
+    expect(reloads).toBe(0); // first load goes through CreateWebWorkerMLCEngine
+    await session.retryLoad("M1-q4f16_1-MLC", { cleanCache: true, freshWorker: true });
+    expect(deleted).toBe(1);
+    expect(reloads).toBeGreaterThanOrEqual(0);
+    expect(session.lastLoadFailure).toBeNull();
+  });
+
+  it("captures and classifies a load failure", async () => {
+    vi.doMock("@mlc-ai/web-llm", () => ({
+      CreateWebWorkerMLCEngine: async () => {
+        throw new SyntaxError("Unexpected end of JSON input");
+      },
+      prebuiltAppConfig: {
+        model_list: [
+          { model_id: "M2-q4f16_1-MLC", vram_required_MB: 500, low_resource_required: true },
+        ],
+      },
+      functionCallingModelIds: [],
+      hasModelInCache: async (_id: string) => false,
+      deleteModelAllInfoInCache: async (_id: string) => {},
+    }));
+    const { createWebllmSession } = await import("../webllm.js");
+    const session = await createWebllmSession({
+      workerFactory: () => ({ terminate() {}, postMessage() {} } as unknown as Worker),
+    });
+    await expect(session.ensureLoaded("M2-q4f16_1-MLC")).rejects.toThrow();
+    expect(session.lastLoadFailure).not.toBeNull();
+    expect(session.lastLoadFailure!.phase).toBe("cache_corruption");
+    expect(session.lastLoadFailure!.modelId).toBe("M2-q4f16_1-MLC");
   });
 });

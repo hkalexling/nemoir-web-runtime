@@ -60,6 +60,10 @@ export {
   type WorkflowState,
   type WorkflowResult,
   type AgentResult,
+  type ModelStageOutputValidationContext,
+  type ModelStageOutputValidationResult,
+  type ModelStageOutputValidator,
+  type ModelStageOutputValidators,
 } from "./runtime-types.js";
 
 // UI Host
@@ -158,11 +162,15 @@ export {
   WebLlmSessionImpl,
   isWebGPUAvailable,
   isCrossOriginIsolated,
+  classifyLoadError,
   type WebLlmSession,
   type WebLlmSessionOptions,
   type WebLlmModelInfo,
   type WebLlmProgressReport,
   type StorageCapacityAssessment,
+  type WebLlmLoadFailure,
+  type WebLlmLoadPhase,
+  type RetryLoadOptions,
 } from "./webllm.js";
 
 // Deterministic stage executor
@@ -193,3 +201,24 @@ export {
   type JsSandboxRequest,
   type OpaqueOriginJsSandboxOptions,
 } from "./sandbox.js";
+
+// WebGPU device-capability detection + model fit
+export {
+  SMALL_MODEL_VRAM_MB,
+  probeDeviceCapabilities,
+  assessModelFit,
+  type WebGpuCapabilityReport,
+  type DeviceStorageReport,
+  type DeviceCapabilityReport,
+  type ModelFitCategory,
+  type ModelFitAssessment,
+} from "./device-capabilities.js";
+
+// Model-source / controlled-mirror profiles for WebLLM
+export {
+  mirrorModelId,
+  toMirroredModelRecord,
+  overlayModelRecords,
+  type MirroredModelRecord,
+  type ModelSourceProfile,
+} from "./model-sources.js";

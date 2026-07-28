@@ -106,6 +106,34 @@ export interface WebLlmSessionOptions {
   readonly modelDownloadSizeOverrides?: Readonly<Record<string, number>>;
 }
 
+export type WebLlmLoadPhase =
+  | "config_or_tokenizer"
+  | "weight_shard"
+  | "wasm_library"
+  | "webgpu_init"
+  | "cache_corruption"
+  | "network"
+  | "unknown";
+
+/** Structured model-load failure, classified for diagnostics + recovery. */
+export interface WebLlmLoadFailure {
+  readonly modelId: string;
+  readonly phase: WebLlmLoadPhase;
+  /** Human-readable message, trimmed and capped for UI display. */
+  readonly message: string;
+  /** Failed artifact URL extracted from the error, when recoverable. */
+  readonly failedUrl?: string;
+  /** True when the error pattern suggests a corrupt/partial cached entry. */
+  readonly suggestsCorruptCache: boolean;
+}
+
+export interface RetryLoadOptions {
+  /** Delete all cached artifacts for the model before loading. */
+  readonly cleanCache?: boolean;
+  /** Terminate and recreate the WebLLM worker before loading. */
+  readonly freshWorker?: boolean;
+}
+
 export interface WebLlmSession {
   /** LLM models available to load (embeddings filtered out). */
   readonly models: readonly WebLlmModelInfo[];
@@ -126,6 +154,16 @@ export interface WebLlmSession {
   ensureLoaded(modelId: string, signal?: AbortSignal): Promise<void>;
   /** Switch to a different model (unloads the current one first). */
   switchModel(modelId: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Retry loading `modelId`, optionally deleting its cached artifacts first
+   * and/or recreating the WebLLM worker. Captures a fresh
+   * {@link WebLlmLoadFailure} when it fails again.
+   */
+  retryLoad(modelId: string, opts?: RetryLoadOptions, signal?: AbortSignal): Promise<void>;
+  /** Delete all cached artifacts for `modelId` (weights, wasm, config, tokenizer). */
+  deleteModelArtifacts(modelId: string): Promise<void>;
+  /** Last classified load failure, or null if the last load succeeded. */
+  readonly lastLoadFailure: WebLlmLoadFailure | null;
   /** Interrupt any in-flight generation. */
   interrupt(): Promise<void>;
   /** Dispose the worker and release resources. Safe to call multiple times. */
@@ -222,6 +260,46 @@ function isLlmModel(record: ModelRecord): boolean {
 // WebLLM adapter
 // ---------------------------------------------------------------------------
 
+/** Default generation cap. Stage outputs are small JSON, so 1024 tokens is
+ * generous and prevents an unbounded model loop from streaming forever. */
+const DEFAULT_MAX_TOKENS = 1024;
+
+/** Small positive penalties discourage degenerate token repetition in small
+ * local models. Callers may override via options.frequency_penalty /
+ * options.presence_penalty. */
+const DEFAULT_FREQUENCY_PENALTY = 0.5;
+const DEFAULT_PRESENCE_PENALTY = 0.5;
+
+/** Inspect accumulated content for a repeating block this often (in deltas). */
+const REPETITION_CHECK_EVERY = 16;
+
+/** A loop is declared when, for some block length B in this set, the tail of
+ * the accumulated content is B repeated consecutively this many times. The
+ * set covers both tight token loops (period 2–5, e.g. ```\n) and phrase-level
+ * loops whose period is longer. Catches loops whose individual deltas differ. */
+const REPETITION_MIN_REPEATS = 3;
+
+/** Return true when the tail of `content` ends with a short block repeated
+ * consecutively. Scans every block length from 2 up so patterns whose period
+ * does not divide a fixed block size are still caught. */
+function hasRepeatingTail(content: string): boolean {
+  if (content.length < REPETITION_MIN_REPEATS * 2) return false;
+  const maxBlock = Math.min(128, Math.floor(content.length / REPETITION_MIN_REPEATS));
+  for (let blockLen = 2; blockLen <= maxBlock; blockLen++) {
+    const slice = content.slice(-blockLen * REPETITION_MIN_REPEATS);
+    const block = slice.slice(0, blockLen);
+    let repeats = true;
+    for (let i = 1; i < REPETITION_MIN_REPEATS; i++) {
+      if (slice.slice(i * blockLen, (i + 1) * blockLen) !== block) {
+        repeats = false;
+        break;
+      }
+    }
+    if (repeats) return true;
+  }
+  return false;
+}
+
 /**
  * Build a ModelAdapter backed by a WebLLM engine.
  *
@@ -239,18 +317,31 @@ export function createWebllmAdapter(
     // tagged-envelope protocol reliably. Allow per-stage override via options.temperature.
     const temperature =
       typeof opts?.temperature === "number" ? (opts.temperature as number) : 0.2;
+    // Bound generation so a small model that locks into a degenerate token
+    // loop cannot stream forever. Stage outputs are small JSON objects, so
+    // 1024 tokens is generous; callers may override via options.max_tokens.
     const maxTokens =
       typeof opts?.max_tokens === "number"
         ? (opts.max_tokens as number)
         : typeof opts?.maxTokens === "number"
           ? (opts.maxTokens as number)
-          : undefined;
+          : DEFAULT_MAX_TOKENS;
     const params: Record<string, unknown> = {
       messages: request.messages,
       stream: true,
       temperature,
+      max_tokens: maxTokens,
+      // Small positive penalties directly discourage the degenerate token
+      // repetition that small local models fall into. Callers may override.
+      frequency_penalty:
+        typeof opts?.frequency_penalty === "number"
+          ? (opts.frequency_penalty as number)
+          : DEFAULT_FREQUENCY_PENALTY,
+      presence_penalty:
+        typeof opts?.presence_penalty === "number"
+          ? (opts.presence_penalty as number)
+          : DEFAULT_PRESENCE_PENALTY,
     };
-    if (maxTokens !== undefined) params.max_tokens = maxTokens;
     // Note: we deliberately do NOT set response_format here. WebLLM's
     // `json_object` mode routes through a grammar compiler that requires a
     // string `schema` and crashes when it is absent (BindingError). The
@@ -281,7 +372,33 @@ export function createWebllmAdapter(
       const stream = (await engine.chat.completions.create(
         buildParams(request) as unknown as Parameters<typeof engine.chat.completions.create>[0],
       )) as AsyncIterable<ChatCompletionChunk>;
-      yield* stream;
+      // Degenerate-repetition guard. Small local models occasionally lock
+      // into an endless token cycle (tight token loops OR phrase-level loops
+      // whose individual deltas differ) that never reaches a stop token.
+      // max_tokens bounds the worst case; this detects the loop on the
+      // accumulated content and aborts early via interrupt() so the trace is
+      // not flooded and the run is not blocked for the full token budget.
+      // After interrupt, the stream ends and the truncated content surfaces
+      // as a normal stage-output validation retry.
+      let accumulated = "";
+      let deltaSinceCheck = 0;
+      let interrupted = false;
+      for await (const chunk of stream) {
+        yield chunk;
+        const delta = chunk.choices[0]?.delta?.content ?? "";
+        if (!delta) continue;
+        accumulated += delta;
+        if (++deltaSinceCheck >= REPETITION_CHECK_EVERY) {
+          deltaSinceCheck = 0;
+          if (hasRepeatingTail(accumulated)) {
+            interrupted = true;
+            break;
+          }
+        }
+      }
+      if (interrupted) {
+        await interrupt();
+      }
     } finally {
       if (request.signal) request.signal.removeEventListener("abort", onAbort);
     }
@@ -315,6 +432,83 @@ export function createWebllmAdapter(
 }
 
 // ---------------------------------------------------------------------------
+// Load-failure classifier
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify a WebLLM model-load error into a phase for diagnostics and
+ * recovery routing.
+ *
+ * WebLLM downloads artifacts in this order: `mlc-chat-config.json`, the
+ * WASM model library, the tokenizer files, and finally `params_shard_*.bin`
+ * weight shards. GPU initialization happens between WASM and tokenizer
+ * fetch. Each phase has recognizable error signatures.
+ */
+export function classifyLoadError(modelId: string, error: unknown): WebLlmLoadFailure {
+  const raw = error instanceof Error ? error.message : String(error);
+  const message = raw.length > 5e3 ? raw.slice(0, 5e3) + "…" : raw;
+  const lower = raw.toLowerCase();
+
+  // Extract a URL from the error message if present.
+  let failedUrl: string | undefined;
+  const urlMatch = raw.match(/https?:\/\/[^\s'"]+/i);
+  if (urlMatch) failedUrl = urlMatch[0];
+
+  // --- Phase detection (order matters; later phases override on URL match) ---
+  let phase: WebLlmLoadPhase;
+
+  // `Cache.add() encountered a network error` after a partial download can
+  // leave a corrupt cache entry that never self-heals. Check this regardless
+  // of which artifact phase was in progress.
+  const corruptCachePattern = /cache\.add\(\) encountered a network error/i.test(raw);
+  let suggestsCorruptCache = corruptCachePattern;
+
+  if (failedUrl) {
+    const u = failedUrl.toLowerCase();
+    if (u.includes("params_shard") || u.endsWith(".bin")) {
+      phase = "weight_shard";
+    } else if (u.endsWith(".wasm") || u.includes("-webgpu.wasm")) {
+      phase = "wasm_library";
+    } else if (
+      u.includes("mlc-chat-config") ||
+      u.includes("tokenizer.json") ||
+      u.includes("tokenizer.model")
+    ) {
+      phase = "config_or_tokenizer";
+      // A config/tokenizer fetch that returns an error page or times out can
+      // leave bad bytes that break subsequent JSON.parse.
+      suggestsCorruptCache = suggestsCorruptCache || /cache\.add\(\) encountered a network error/i.test(raw);
+    } else if (u.includes("huggingface.co") || u.includes("raw.githubusercontent.com")) {
+      phase = failedUrl.includes(".wasm") ? "wasm_library" : "weight_shard";
+    } else {
+      phase = "network";
+    }
+  } else if (/syntaxerror|json|unexpected end of (json )?input/i.test(raw)) {
+    // A JSON parse failure almost always means a truncated/corrupt cached
+    // mlc-chat-config.json or tokenizer response (e.g. a partial download
+    // that HTTP 200'd with an error page body).
+    phase = "cache_corruption";
+    suggestsCorruptCache = true;
+  } else if (
+    /webgpu|gpu adapter|shader-f16|shader_f16|feature support|device was lost|insufficient memory/i.test(
+      raw,
+    )
+  ) {
+    phase = "webgpu_init";
+  } else if (
+    /networkerror|failed to fetch|network error|err_network|cache\.add\(\) encountered a network error|fetchfailed|timed out/i.test(
+      lower,
+    )
+  ) {
+    phase = "network";
+  } else {
+    phase = "unknown";
+  }
+
+  return { modelId, phase, message, failedUrl, suggestsCorruptCache };
+}
+
+// ---------------------------------------------------------------------------
 // WebLlmSession
 // ---------------------------------------------------------------------------
 
@@ -326,6 +520,7 @@ export class WebLlmSessionImpl implements WebLlmSession {
   private loadedModelId?: string;
   private unhealthy = false;
   private loadPromise?: Promise<void>;
+  private _lastLoadFailure: WebLlmLoadFailure | null = null;
 
   constructor(opts: WebLlmSessionOptions) {
     this.opts = opts;
@@ -341,6 +536,10 @@ export class WebLlmSessionImpl implements WebLlmSession {
 
   get currentModelId(): string | undefined {
     return this.loadedModelId;
+  }
+
+  get lastLoadFailure(): WebLlmLoadFailure | null {
+    return this._lastLoadFailure;
   }
 
   isModelLoaded(modelId: string): boolean {
@@ -405,11 +604,17 @@ export class WebLlmSessionImpl implements WebLlmSession {
   }
 
   async ensureLoaded(modelId: string, signal?: AbortSignal): Promise<void> {
-    if (this.isModelLoaded(modelId)) return;
+    if (this.isModelLoaded(modelId)) {
+      this._lastLoadFailure = null;
+      return;
+    }
     // Coalesce concurrent loads of the same model.
     if (this.loadPromise) {
       await this.loadPromise;
-      if (this.isModelLoaded(modelId)) return;
+      if (this.isModelLoaded(modelId)) {
+        this._lastLoadFailure = null;
+        return;
+      }
     }
     this.loadPromise = this.loadModel(modelId, signal);
     try {
@@ -443,6 +648,7 @@ export class WebLlmSessionImpl implements WebLlmSession {
     }
     this.engine = undefined;
     this.loadedModelId = undefined;
+    this._lastLoadFailure = null;
   }
 
   get adapter(): ModelAdapter {
@@ -563,6 +769,66 @@ export class WebLlmSessionImpl implements WebLlmSession {
     };
   }
 
+  async retryLoad(
+    modelId: string,
+    opts?: RetryLoadOptions,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const cleanCache = opts?.cleanCache ?? false;
+    const freshWorker = opts?.freshWorker ?? false;
+
+    // Coalesce with an in-flight load of the same model when no recovery is
+    // requested; a recovery retry must run on its own so it can mutate the
+    // worker/cache state.
+    if (!cleanCache && !freshWorker && this.loadPromise) {
+      await this.loadPromise;
+      if (this.isModelLoaded(modelId)) {
+        this._lastLoadFailure = null;
+        return;
+      }
+    }
+
+    if (cleanCache) {
+      await this.deleteModelArtifacts(modelId).catch(() => {
+        // Best-effort: a cache-delete failure should not block retry.
+      });
+      this.invalidateCachedState();
+    }
+
+    if (freshWorker || cleanCache) {
+      // Force loadModel to recreate the worker + engine rather than reload
+      // onto a possibly-corrupted engine.
+      await this.unloadCurrent();
+      if (this.worker) {
+        this.worker.terminate();
+        this.worker = undefined;
+      }
+      this.unhealthy = true;
+    }
+
+    this.loadPromise = this.loadModel(modelId, signal);
+    try {
+      await this.loadPromise;
+      this._lastLoadFailure = null;
+    } finally {
+      this.loadPromise = undefined;
+    }
+  }
+
+  async deleteModelArtifacts(modelId: string): Promise<void> {
+    const webllm = await loadWebllm();
+    await this.ensureModelList();
+    const appConfig: AppConfig = {
+      model_list: [
+        ...webllm.prebuiltAppConfig.model_list,
+        ...(this.opts.extraModels ?? []),
+      ],
+      cacheBackend: this.cacheBackend,
+    };
+    await webllm.deleteModelAllInfoInCache(modelId, appConfig);
+    this.invalidateCachedState();
+  }
+
   // -----------------------------------------------------------------------
   // Internals
   // -----------------------------------------------------------------------
@@ -580,39 +846,50 @@ export class WebLlmSessionImpl implements WebLlmSession {
       cacheBackend: this.cacheBackend,
     };
 
-    // If the engine is unhealthy from a prior interrupted run, recreate it.
-    if (this.unhealthy || !this.engine) {
-      await this.unloadCurrent();
-      if (!this.worker) this.worker = this.opts.workerFactory();
-      const onProgress = this.opts.onProgress;
-      this.engine = await webllm.CreateWebWorkerMLCEngine(
-        this.worker,
-        modelId,
-        {
-          appConfig,
-          initProgressCallback: onProgress
-            ? (r: InitProgressReport) =>
-                onProgress({
-                  text: r.text,
-                  progress: r.progress,
-                  timeElapsed: r.timeElapsed,
-                })
-            : undefined,
-        },
-      );
-      this.unhealthy = false;
-    } else {
-      // Engine exists and is healthy — reload onto it.
-      await this.engine.reload(modelId);
-    }
-    this.loadedModelId = modelId;
-    this.invalidateCachedState();
+    try {
+      // If the engine is unhealthy from a prior interrupted run, recreate it.
+      if (this.unhealthy || !this.engine) {
+        await this.unloadCurrent();
+        if (!this.worker) this.worker = this.opts.workerFactory();
+        const onProgress = this.opts.onProgress;
+        this.engine = await webllm.CreateWebWorkerMLCEngine(
+          this.worker,
+          modelId,
+          {
+            appConfig,
+            initProgressCallback: onProgress
+              ? (r: InitProgressReport) =>
+                  onProgress({
+                    text: r.text,
+                    progress: r.progress,
+                    timeElapsed: r.timeElapsed,
+                  })
+              : undefined,
+          },
+        );
+        this.unhealthy = false;
+      } else {
+        // Engine exists and is healthy — reload onto it.
+        await this.engine.reload(modelId);
+      }
+      this.loadedModelId = modelId;
+      this.invalidateCachedState();
 
-    // If the load signal aborted mid-init, mark unhealthy so the next call
-    // recreates the worker rather than relying on a half-loaded engine.
-    if (signal?.aborted) {
+      // If the load signal aborted mid-init, mark unhealthy so the next call
+      // recreates the worker rather than relying on a half-loaded engine.
+      if (signal?.aborted) {
+        this.unhealthy = true;
+        throw new ModelProviderError("model load cancelled");
+      }
+      this._lastLoadFailure = null;
+    } catch (error) {
+      // A failed init corrupts engine state and possibly the cache; mark the
+      // engine unhealthy so retryLoad recreates it rather than calling
+      // reload() on a half-initialized engine.
       this.unhealthy = true;
-      throw new ModelProviderError("model load cancelled");
+      if (error instanceof ModelProviderError) throw error;
+      this._lastLoadFailure = classifyLoadError(modelId, error);
+      throw error;
     }
   }
 
