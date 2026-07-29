@@ -342,12 +342,40 @@ export function createWebllmAdapter(
           ? (opts.presence_penalty as number)
           : DEFAULT_PRESENCE_PENALTY,
     };
-    // Note: we deliberately do NOT set response_format here. WebLLM's
-    // `json_object` mode routes through a grammar compiler that requires a
-    // string `schema` and crashes when it is absent (BindingError). The
-    // tagged-envelope protocol already instructs the model via the system
-    // prompt to emit JSON, and ModelStageExecutor parses + retries malformed
-    // JSON — that is the portable, model-agnostic baseline.
+    // Grammar-constrained JSON for tool-less model stages. When a stage has
+    // no callable tools, the runtime parses its output as direct JSON
+    // (parsePlainStageOutput), so constraining generation to the stage's JSON
+    // Schema via WebLLM's xgrammar backend guarantees a structurally valid
+    // object by construction. Small models cannot then emit the malformed JSON
+    // (missing commas, stray quotes, duplicate keys, output-contract echo)
+    // that previously consumed the retry budget and occasionally hung a run.
+    //
+    // Tool-enabled stages keep the tagged-envelope protocol: a single static
+    // schema cannot express "tool_call OR final envelope", and `structural_tag`
+    // mode is WebLLM's dedicated tool-calling constrained path (future work).
+    //
+    // A `schema` string is always supplied. The schema-less `json_object`
+    // path crashes WebLLM's grammar compiler (BindingError); the documented
+    // usage is `json_object` + `schema`, which the `cs1k` model libraries are
+    // built for. Set options.constrainedDecoding=false to opt out for a stage.
+    const tools = Array.isArray(request.tools) ? request.tools : [];
+    const schema = request.outputSchema as Record<string, unknown> | undefined;
+    const schemaProps =
+      schema && (schema.properties as Record<string, unknown> | undefined);
+    const disableConstrained =
+      opts?.constrainedDecoding === false ||
+      opts?.constrained_decoding === false;
+    if (
+      !disableConstrained &&
+      tools.length === 0 &&
+      schemaProps &&
+      Object.keys(schemaProps).length > 0
+    ) {
+      params.response_format = {
+        type: "json_object",
+        schema: JSON.stringify(schema),
+      } as Record<string, unknown>;
+    }
     return params;
   }
 

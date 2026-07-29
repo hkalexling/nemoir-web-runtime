@@ -142,6 +142,81 @@ describe("WebLLM adapter — completion mapping", () => {
   });
 });
 
+describe("WebLLM adapter — grammar-constrained JSON", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("injects response_format json_object+schema for tool-less stages", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [{ choices: [{ delta: { content: "{}" } }] } as unknown as ChatCompletionChunk],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "ProduceGuidance",
+      messages: [],
+      tools: [],
+      outputSchema: {
+        type: "object",
+        properties: { hint: { type: "string" } },
+        required: ["hint"],
+        additionalProperties: false,
+      },
+      options: {},
+    });
+    const rf = (calls[0] as { response_format?: Record<string, unknown> }).response_format;
+    expect(rf).toEqual({
+      type: "json_object",
+      schema: JSON.stringify({
+        type: "object",
+        properties: { hint: { type: "string" } },
+        required: ["hint"],
+        additionalProperties: false,
+      }),
+    });
+  });
+
+  it("omits response_format for tool-enabled stages (tagged envelope path)", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [{ choices: [{ delta: { content: "{}" } }] } as unknown as ChatCompletionChunk],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "AskClarify",
+      messages: [],
+      tools: [{ type: "function", function: { name: "elicit" } }],
+      outputSchema: { type: "object", properties: { clarification: { type: "string" } } },
+      options: {},
+    });
+    expect((calls[0] as { response_format?: unknown }).response_format).toBeUndefined();
+  });
+
+  it("honors options.constrainedDecoding=false to opt out", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [{ choices: [{ delta: { content: "{}" } }] } as unknown as ChatCompletionChunk],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "ProduceGuidance",
+      messages: [],
+      tools: [],
+      outputSchema: { type: "object", properties: { hint: { type: "string" } } },
+      options: { constrainedDecoding: false },
+    });
+    expect((calls[0] as { response_format?: unknown }).response_format).toBeUndefined();
+  });
+});
+
 describe("WebLLM adapter — cancellation", () => {
   beforeEach(() => {
     vi.resetModules();

@@ -769,6 +769,35 @@ describe("ModelStageExecutor — tagged-envelope hardening", () => {
     expect(calls.length).toBe(1);
   });
 
+  it("repairs small-model JSON the comma-only scanner could not (unquoted keys, truncated)", async () => {
+    // Combines two failure modes the previous comma-only scanner could not
+    // handle: unquoted object keys and a missing closing brace. jsonrepair
+    // recovers a valid object so the run does not consume retry budget.
+    const content =
+      "{mode: \"hint\", hint: \"Check the empty array case.\", concept: \"edge cases\"";
+    const { adapter, calls } = fakeAdapter([{ content }]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+      actionProtocol: "tagged_envelope",
+    });
+    const ctx = makeCtx({
+      writes: [
+        { name: "mode", type: "string" },
+        { name: "hint", type: "string" },
+        { name: "concept", type: "string" },
+      ],
+    });
+    const result = await executor.execute(ctx);
+    expect(result).toEqual({
+      mode: "hint",
+      hint: "Check the empty array case.",
+      concept: "edge cases",
+    });
+    expect(calls.length).toBe(1);
+  });
+
   it("feeds tool results back as user messages (not role:tool)", async () => {
     const { adapter, calls } = fakeAdapter([
       { content: JSON.stringify({ kind: "tool_call", tool: "read", args: { question: "hi" } }) },

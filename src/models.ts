@@ -43,6 +43,7 @@ import {
   type ModelRouter,
   type ModelRequest,
 } from "./model-contract.js";
+import { jsonrepair } from "jsonrepair";
 import {
   type StageContext,
   type StageExecutor,
@@ -570,112 +571,38 @@ function extractFirstPlainJsonObject(content: string): string | null {
 }
 
 /**
- * Parse model JSON, tolerant of the missing commas that small local models
- * routinely drop between object properties and array elements. Strict parse
- * is attempted first; only if it fails is the repair pass applied, so valid
- * JSON is never altered.
+ * Parse model JSON. A strict `JSON.parse` is attempted first so valid JSON is
+ * never altered; only on failure is a repair pass applied. WebLLM's grammar
+ * constraint (set in `webllm.ts` for tool-less stages) already guarantees
+ * structural validity for `cs1k` models, so the repair path is a safety net
+ * for non-grammar models, tool-envelope stages, and the rare malformed edge.
+ *
+ * `jsonrepair` handles the full class of small-model mistakes (missing
+ * commas, quotes, brackets, single quotes, truncated JSON, trailing commas,
+ * Python `None/True/False`, escaped strings, code fences). It supersedes the
+ * previous comma-only scanner.
  */
 function parseJsonTolerantly(json: string, stageId: string): unknown {
   try {
     return JSON.parse(json);
   } catch (firstError) {
+    let repaired: string;
     try {
-      return JSON.parse(repairMissingCommas(json));
+      repaired = jsonrepair(json);
     } catch {
       throw new ModelOutputValidationError(
         `model returned invalid JSON in stage '${stageId}': ${firstError instanceof Error ? firstError.message : String(firstError)}`,
       );
     }
+    try {
+      return JSON.parse(repaired);
+    } catch (repairError) {
+      throw new ModelOutputValidationError(
+        `model returned invalid JSON in stage '${stageId}': ${firstError instanceof Error ? firstError.message : String(firstError)}` +
+          ` (jsonrepair: ${repairError instanceof Error ? repairError.message : String(repairError)})`,
+      );
+    }
   }
-}
-
-/**
- * Insert commas that small models omit between JSON values. The scanner
- * walks the input tracking string state; when a value ends (a closing
- * string quote, a closing `}`/`]`, or the end of a number/keyword token)
- * and the next non-whitespace token starts a new value (`"`, `{`, `[`, a
- * digit, or `true`/`false`/`null`) without an intervening `,`, one is
- * inserted. Object keys are never modified because a closing quote
- * immediately followed by `:` is recognised as a key, not a value.
- */
-function repairMissingCommas(json: string): string {
-  const out: string[] = [];
-  let i = 0;
-  let inString = false;
-  let escape = false;
-
-  function nextNonWhitespace(from: number): string | undefined {
-    let j = from;
-    while (j < json.length && /\s/.test(json[j] ?? "")) j++;
-    return json[j];
-  }
-
-  function maybeInsertComma(afterIndex: number): void {
-    const next = nextNonWhitespace(afterIndex);
-    // No comma needed when the next token is a structural closer, a colon
-    // (meaning the string we just closed was an object key), or the user
-    // already placed a comma.
-    if (
-      next === undefined ||
-      next === "," ||
-      next === "}" ||
-      next === "]" ||
-      next === ":"
-    ) {
-      return;
-    }
-    out.push(",");
-  }
-
-  while (i < json.length) {
-    const ch = json[i] ?? "";
-
-    if (inString) {
-      out.push(ch);
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
-        maybeInsertComma(i + 1);
-      }
-      i++;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-      out.push(ch);
-      i++;
-      continue;
-    }
-
-    if (ch === "}" || ch === "]") {
-      out.push(ch);
-      maybeInsertComma(i + 1);
-      i++;
-      continue;
-    }
-
-    // Numbers and JSON keywords (true, false, null) are bare value tokens.
-    if (/[0-9\-]/.test(ch) || ch === "t" || ch === "f" || ch === "n") {
-      const start = i;
-      if (ch === "t" || ch === "f" || ch === "n") {
-        while (i < json.length && /[a-z]/.test(json[i] ?? "")) i++;
-      } else {
-        while (i < json.length && /[0-9.\-+eE]/.test(json[i] ?? "")) i++;
-      }
-      out.push(json.slice(start, i));
-      maybeInsertComma(i);
-      continue;
-    }
-
-    out.push(ch);
-    i++;
-  }
-
-  return out.join("");
 }
 
 function parsePlainStageOutput(content: string, stageId: string): Record<string, unknown> {
