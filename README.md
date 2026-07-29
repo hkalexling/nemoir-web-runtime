@@ -6,12 +6,16 @@ enforcement, model-backed stage execution, and live event streaming.
 
 ## Status
 
-**Phase 3 (WebLLM adapter + generic UI) is implemented.** The runtime
+**Phase 3 (WebLLM adapter + generic UI) is implemented** with
+grammar-constrained JSON decoding for tool-less stages,
+structured load-failure diagnostics and recovery, deployer-controlled
+model-source profiles, device-capability probing and model-fit
+classification, and bounded-output/repetition guards. The runtime
 provides the full execution stack (state machine, guard/expr evaluator,
 policy engine, `ModelStageExecutor`, events, `WorkflowAgent` factory) plus
 a framework-neutral WebLLM session/adapter. The generated runner UI
-(`main.tsx`) is a React consumer of this package; the runtime itself does
-not require React.
+(`main.tsx`) is a React consumer of this package and `@nemoir/web-ui`; the
+runtime itself does not require React.
 
 ## Design
 
@@ -25,6 +29,37 @@ not require React.
   `user.confirm` via an injected `WebUiHost`. No `fs.*`, no `os.shell`.
   Workflows needing them are rejected at compile time by
   `nemoir-backend-web`'s `validate_for_web`.
+- **Grammar-constrained decoding.** Tool-less model stages inject
+  `response_format: { type: "json_object", schema }` so WebLLM's xgrammar
+  backend guarantees a structurally valid object. Tool-enabled stages
+  retain the tagged-envelope protocol (no static schema can express
+  "tool_call OR final"). Per-stage opt-out:
+  `options.constrainedDecoding = false`.
+- **Tolerant JSON parsing.** Strict `JSON.parse` first; `jsonrepair`
+  fallback handles the full class of small-model mistakes (missing commas,
+  quotes, brackets, trailing commas, Python literals, code fences).
+- **Model-generation parameters.** `ModelGenerationParams` (temperature,
+  maxTokens, frequencyPenalty, presencePenalty) resolved via
+  `RunOptions.generationParams` with sensible defaults (0.2 temp, 1024
+  maxTokens, 0.5 penalties) and forwarded to the model adapter.
+- **Semantic model-output validators.** `RunOptions.modelOutputValidators`
+  keyed by model-stage ID run inside the retry path; a returned error is
+  fed back to the model through the normal retry loop.
+- **WebLLM load-failure diagnostics + recovery.** `classifyLoadError()`
+  produces a structured `WebLlmLoadFailure` (phase, failed URL,
+  corrupt-cache flag). `retryLoad()` optionally deletes cached artifacts
+  (`cleanCache`) and/or recreates the WebLLM worker (`freshWorker`).
+  `deleteModelArtifacts()` clears all cached model data.
+- **Device capabilities + model fit.** `probeDeviceCapabilities()` probes
+  WebGPU (shader-f16 support, storage buffer limit). `assessModelFit()`
+  classifies each model (recommended, likely_ok, needs_download,
+  oversized_vram, missing_feature, buffer_limit, unknown) to guide
+  selection. Conservative: never blocks a load.
+- **Deployer-controlled model sources.** `ModelSourceProfile` and
+  `MirroredModelRecord` let deployers host MLC artifacts on institutional
+  CDNs or object storage. `overlayModelRecords()` merges mirror records
+  with source-specific `model_id` suffixes to avoid cross-origin cache
+  corruption. Public mirrors are intentionally not wired by default.
 - **Action protocol.** Model stages use a `tagged-envelope` protocol by
   default on the web target (`{"kind":"final","output":{...}}` /
   `{"kind":"tool_call","tool":"...","args":{...}}`), which works with
@@ -34,6 +69,11 @@ not require React.
   model adapters (WebLLM `engine.interruptGenerate()`) and UI-host tools,
   and `WorkflowRuntime.stream()` aborts its background run on early
   consumer break.
+- **Degenerate-repetition guard.** Detects repeating token/phrase tails
+  during streaming and interrupts via `engine.interruptGenerate()`.
+- **Empty-content rejection.** An empty provider response fails the run
+  immediately rather than retrying (avoids degenerate echo loops on small
+  models).
 - **Dynamic code is explicit and policy-gated.** `browser.js.sandbox` is for
   a user input or prior model-stage output that a later deterministic stage
   executes only after `before browser.js.sandbox(code) requires user.confirm`.
