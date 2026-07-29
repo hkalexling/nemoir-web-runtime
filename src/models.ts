@@ -753,7 +753,12 @@ export class ModelStageExecutor implements StageExecutor {
         messages: [...messages],
         tools: toolSchemas,
         outputSchema,
-        options: { reasoning: effectiveReasoning },
+        // Forward generation parameters (temperature, maxTokens, penalties)
+        // resolved from RunOptions so a caller can tune sampling per run.
+        options: {
+          reasoning: effectiveReasoning,
+          ...(ctx.options.generationParams ?? {}),
+        },
         signal: ctx.options.signal,
       };
 

@@ -334,13 +334,17 @@ export function createWebllmAdapter(
       // Small positive penalties directly discourage the degenerate token
       // repetition that small local models fall into. Callers may override.
       frequency_penalty:
-        typeof opts?.frequency_penalty === "number"
-          ? (opts.frequency_penalty as number)
-          : DEFAULT_FREQUENCY_PENALTY,
+        typeof opts?.frequencyPenalty === "number"
+          ? (opts.frequencyPenalty as number)
+          : typeof opts?.frequency_penalty === "number"
+            ? (opts.frequency_penalty as number)
+            : DEFAULT_FREQUENCY_PENALTY,
       presence_penalty:
-        typeof opts?.presence_penalty === "number"
-          ? (opts.presence_penalty as number)
-          : DEFAULT_PRESENCE_PENALTY,
+        typeof opts?.presencePenalty === "number"
+          ? (opts.presencePenalty as number)
+          : typeof opts?.presence_penalty === "number"
+            ? (opts.presence_penalty as number)
+            : DEFAULT_PRESENCE_PENALTY,
     };
     // Grammar-constrained JSON for tool-less model stages. When a stage has
     // no callable tools, the runtime parses its output as direct JSON

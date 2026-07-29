@@ -41,6 +41,36 @@ export type ModelStageOutputValidators = Readonly<
   Record<string, ModelStageOutputValidator | undefined>
 >;
 
+/**
+ * Generation parameters forwarded to a model adapter (e.g. WebLLM) for a
+ * model stage. All fields are optional; callers may override only the ones
+ * they care about and `resolveRunOptions` fills the rest from
+ * `DEFAULT_GENERATION_PARAMS`.
+ */
+export interface ModelGenerationParams {
+  /** Sampling temperature. Default 0.2 (low, for reliable structured output). */
+  readonly temperature?: number;
+  /** Maximum tokens to generate. Default 1024 (stage outputs are small JSON). */
+  readonly maxTokens?: number;
+  /** Frequency penalty. Default 0.5 (discourages degenerate repetition). */
+  readonly frequencyPenalty?: number;
+  /** Presence penalty. Default 0.5 (discourages degenerate repetition). */
+  readonly presencePenalty?: number;
+}
+
+/**
+ * Sensible defaults for local small-model structured generation: low
+ * temperature for reliably following the output contract, a generous token
+ * cap bounded enough to stop runaway generation, and small positive
+ * penalties to discourage the degenerate repetition small models fall into.
+ */
+export const DEFAULT_GENERATION_PARAMS: ModelGenerationParams = {
+  temperature: 0.2,
+  maxTokens: 1024,
+  frequencyPenalty: 0.5,
+  presencePenalty: 0.5,
+};
+
 export interface RunOptions {
   /** Max workflow steps before raising MaxStepsExceededError. Default 64. */
   readonly maxSteps: number;
@@ -61,6 +91,11 @@ export interface RunOptions {
    * sent back to the model through the normal stage-output retry path.
    */
   readonly modelOutputValidators?: ModelStageOutputValidators;
+  /**
+   * Optional model-generation overrides forwarded to the adapter. Keys not
+   * supplied fall back to `DEFAULT_GENERATION_PARAMS`.
+   */
+  readonly generationParams?: ModelGenerationParams;
 }
 
 export const DEFAULT_RUN_OPTIONS: RunOptions = {
@@ -91,6 +126,9 @@ export function resolveRunOptions(
     reasoning: opts.reasoning ?? DEFAULT_RUN_OPTIONS.reasoning,
     signal: opts.signal,
     modelOutputValidators: opts.modelOutputValidators ?? DEFAULT_RUN_OPTIONS.modelOutputValidators,
+    generationParams: opts.generationParams
+      ? { ...DEFAULT_GENERATION_PARAMS, ...opts.generationParams }
+      : DEFAULT_GENERATION_PARAMS,
   };
 }
 

@@ -99,6 +99,29 @@ describe("ModelStageExecutor — content-only stages", () => {
     expect(calls.length).toBe(1);
   });
 
+  it("forwards generation params from RunOptions through to the adapter request", async () => {
+    const { adapter, calls } = fakeAdapter([
+      { content: '{"summary": "done"}' },
+    ]);
+    const executor = new ModelStageExecutor({
+      model: adapter,
+      tools: new ToolRegistry([]),
+      maxToolRounds: 32,
+    });
+    const ctx = makeCtx({
+      writes: [{ name: "summary", type: "string" }],
+      options: { generationParams: { temperature: 0.7, maxTokens: 200 } },
+    });
+    await executor.execute(ctx);
+    const opts = calls[0].options as Record<string, unknown>;
+    // Caller override is forwarded as-is.
+    expect(opts.temperature).toBe(0.7);
+    expect(opts.maxTokens).toBe(200);
+    // resolveRunOptions fills the remaining defaults.
+    expect(opts.frequencyPenalty).toBe(0.5);
+    expect(opts.presencePenalty).toBe(0.5);
+  });
+
   it("throws on invalid JSON with maxModelRetries=0", async () => {
     const { adapter } = fakeAdapter([{ content: "not json" }]);
     const executor = new ModelStageExecutor({

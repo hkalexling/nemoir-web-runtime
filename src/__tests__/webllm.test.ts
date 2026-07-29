@@ -217,6 +217,62 @@ describe("WebLLM adapter — grammar-constrained JSON", () => {
   });
 });
 
+describe("WebLLM adapter — generation params", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("defaults to temperature 0.2 / maxTokens 1024 / penalties 0.5", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [{ choices: [{ delta: { content: "{}" } }] } as unknown as ChatCompletionChunk],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {},
+    });
+    const c = calls[0] as Record<string, unknown>;
+    expect(c.temperature).toBe(0.2);
+    expect(c.max_tokens).toBe(1024);
+    expect(c.frequency_penalty).toBe(0.5);
+    expect(c.presence_penalty).toBe(0.5);
+  });
+
+  it("forwards caller-supplied generation overrides (camelCase)", async () => {
+    const { engine, calls } = makeFakeEngine({
+      chunksPerCall: [
+        [{ choices: [{ delta: { content: "{}" } }] } as unknown as ChatCompletionChunk],
+      ],
+    });
+    const session = await makeSession(engine);
+    await session.ensureLoaded("Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+    await session.adapter.complete({
+      stageId: "s",
+      messages: [],
+      tools: [],
+      outputSchema: {},
+      options: {
+        temperature: 0.7,
+        maxTokens: 256,
+        frequencyPenalty: 0.2,
+        presencePenalty: 0.3,
+      },
+    });
+    const c = calls[0] as Record<string, unknown>;
+    expect(c.temperature).toBe(0.7);
+    expect(c.max_tokens).toBe(256);
+    expect(c.frequency_penalty).toBe(0.2);
+    expect(c.presence_penalty).toBe(0.3);
+  });
+});
+
 describe("WebLLM adapter — cancellation", () => {
   beforeEach(() => {
     vi.resetModules();
