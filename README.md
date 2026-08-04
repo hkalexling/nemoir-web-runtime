@@ -4,6 +4,14 @@ TypeScript runtime core for NemoIR — execute compiled agent workflows in
 the browser as structured state machines with tool orchestration, policy
 enforcement, model-backed stage execution, and live event streaming.
 
+## Compiler references
+
+NemoIR is a research-pilot compiler stack. Canonical workflow language, IR semantics, and browser-target behavior live in the public compiler repo:
+
+- [Compiler repo](https://github.com/hkalexling/nemoir)
+- [DSL and IR spec](https://github.com/hkalexling/nemoir/blob/master/docs/dsl-and-ir.md)
+- [Web target guide](https://github.com/hkalexling/nemoir/blob/master/docs/targets/web.md)
+
 ## Status
 
 **Phase 3 (WebLLM adapter + generic UI) is implemented** with
@@ -25,6 +33,7 @@ runtime itself does not require React.
 - **Backend-neutral.** It is a TypeScript port of `python/nemoir-runtime`,
   reproducing the same state-machine loop, guard/expression evaluator,
   output validation, policy enforcement, and event streaming semantics.
+  The compiler docs above remain canonical for DSL/IR and web-target semantics.
 - **Browser-safe only.** Ships implementations for `user.elicit` and
   `user.confirm` via an injected `WebUiHost`. No `fs.*`, no `os.shell`.
   Workflows needing them are rejected at compile time by
