@@ -161,3 +161,8 @@ runtime against the compiled `workflow.json`.
 npx tsc --noEmit   # typecheck
 npx vitest run     # tests (no GPU required — WebLLM is mocked)
 ```
+
+## Releasing
+
+Maintainers should follow [RELEASING.md](RELEASING.md); npm publication is
+performed only by the trusted GitHub Actions workflow.

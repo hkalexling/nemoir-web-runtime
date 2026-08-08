@@ -3,6 +3,13 @@
   "version": "0.4.0",
   "description": "TypeScript runtime core for NemoIR — execute compiled agent workflows in the browser as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hkalexling/nemoir-web-runtime.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

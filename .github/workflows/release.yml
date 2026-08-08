@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and validate only; do not publish
+        type: boolean
+        default: true
+      ref:
+        description: Exact commit SHA to dry-run or retry (defaults to the selected ref)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# Never cancel a release that may already be publishing an immutable version.
+concurrency:
+  group: release-web-runtime-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect release candidate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      package_name: ${{ steps.detect.outputs.package_name }}
+      sha: ${{ steps.detect.outputs.sha }}
+      eligible: ${{ steps.detect.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Validate version bump
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          node <<'NODE'
+          const { appendFileSync, readFileSync } = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+
+          const output = (key, value) =>
+            appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+          const parse = (value) => {
+            const match = semver.exec(value);
+            if (!match) throw new Error(`expected canonical SemVer X.Y.Z, got ${value}`);
+            return match.slice(1).map(Number);
+          };
+          const currentManifest = JSON.parse(readFileSync("package.json", "utf8"));
+          const current = currentManifest.version;
+          const packageName = currentManifest.name;
+          const sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+          parse(current);
+          output("version", current);
+          output("package_name", packageName);
+          output("sha", sha);
+
+          if (process.env.EVENT_NAME !== "push") {
+            output("eligible", "true");
+            console.log(`Manual run for ${packageName}@${current} at ${sha}`);
+            process.exit(0);
+          }
+
+          const before = process.env.BEFORE_SHA;
+          if (!before || /^0+$/.test(before)) {
+            output("eligible", "false");
+            console.log("No prior default-branch revision; automatic release is intentionally skipped.");
+            process.exit(0);
+          }
+
+          let previousManifest;
+          try {
+            previousManifest = JSON.parse(
+              execFileSync("git", ["show", `${before}:package.json`], { encoding: "utf8" }),
+            );
+          } catch {
+            output("eligible", "false");
+            console.log(`package.json was unavailable at ${before}; automatic release is skipped.`);
+            process.exit(0);
+          }
+
+          const previous = previousManifest.version;
+          parse(previous);
+          if (previous === current) {
+            output("eligible", "false");
+            console.log(`Version is unchanged at ${current}; nothing to release.`);
+            process.exit(0);
+          }
+
+          const currentParts = parse(current);
+          const previousParts = parse(previous);
+          const increased = currentParts.some(
+            (part, index) => part > previousParts[index] && currentParts.slice(0, index).every((v, i) => v === previousParts[i]),
+          );
+          if (!increased) throw new Error(`version must increase: ${previous} -> ${current}`);
+
+          output("eligible", "true");
+          console.log(`Release candidate: ${packageName}@${previous} -> ${current} (${sha})`);
+          NODE
+
+  prepare:
+    name: Verify and pack
+    needs: detect
+    if: needs.detect.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: NEMOIR_RELEASE_VERIFY=1 npx vitest run src/__tests__/release-gate.test.ts
+      - run: npm pack --dry-run
+
+      - name: Create release tarball
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --json > pack.json
+          tarball="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("pack.json", "utf8"))[0].filename)')"
+          rm pack.json
+          test -f "${tarball}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          sha256sum "${tarball}" > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.detect.outputs.version }}
+          path: |
+            ${{ steps.pack.outputs.tarball }}
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish v${{ needs.detect.outputs.version }}
+    needs: [detect, prepare]
+    if: >-
+      needs.detect.outputs.eligible == 'true' &&
+      (github.event_name == 'push' || inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ needs.detect.outputs.version }}
+
+      - name: Verify release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.tgz' -type f | wc -l)" -eq 1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      - name: Require npm trusted-publishing support
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(npm --version)"
+          IFS=. read -r major minor patch <<< "${version}"
+          if (( major < 11 || (major == 11 && minor < 5) )); then
+            echo "npm ${version} is too old for trusted publishing; require >= 11.5.1" >&2
+            exit 1
+          fi
+
+      - name: Preflight immutable release state
+        id: preflight
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          PACKAGE_NAME: ${{ needs.detect.outputs.package_name }}
+          RELEASE_SHA: ${{ needs.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          tag_sha=""
+          tag_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags%2F${tag}" 2>/dev/null || true)"
+          if [[ -n "${tag_ref}" ]]; then
+            tag_sha="$(printf '%s' "${tag_ref}" | jq -r '.object.sha')"
+            tag_type="$(printf '%s' "${tag_ref}" | jq -r '.object.type')"
+            if [[ "${tag_type}" == "tag" ]]; then
+              tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha')"
+            fi
+            if [[ "${tag_sha}" != "${RELEASE_SHA}" ]]; then
+              echo "Tag ${tag} targets ${tag_sha}, not ${RELEASE_SHA}; refusing to reuse a version." >&2
+              exit 1
+            fi
+          fi
+
+          release_state="missing"
+          if draft="$(gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "${draft}" == "true" ]]; then
+              release_state="draft"
+            else
+              release_state="final"
+            fi
+          fi
+          if [[ "${release_state}" == "final" ]]; then
+            echo "Final GitHub Release ${tag} already exists; refusing overwrite." >&2
+            exit 1
+          fi
+
+          npm_exists=false
+          if npm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            npm_exists=true
+          fi
+
+          already_published=false
+          if [[ "${npm_exists}" == "true" ]]; then
+            if [[ "${tag_sha}" == "${RELEASE_SHA}" && "${release_state}" == "draft" ]]; then
+              already_published=true
+              echo "Registry version exists with a matching draft release; resuming finalization."
+            else
+              echo "${PACKAGE_NAME}@${VERSION} already exists without a matching draft at this SHA; refusing." >&2
+              exit 1
+            fi
+          fi
+          echo "npm_already_published=${already_published}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or refresh draft GitHub Release
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          RELEASE_SHA: ${{ needs.detect.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "${tag}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            gh release upload "${tag}" ./*.tgz SHA256SUMS --clobber
+          else
+            gh release create "${tag}" ./*.tgz SHA256SUMS \
+              --target "${RELEASE_SHA}" \
+              --title "${tag}" \
+              --draft \
+              --generate-notes
+          fi
+
+      - name: Publish prebuilt tarball to npm
+        if: steps.preflight.outputs.npm_already_published != 'true'
+        shell: bash
+        run: npm publish ./*.tgz --access public --ignore-scripts
+
+      - name: Attest release archive
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ./*.tgz
+
+      - name: Finalize GitHub Release
+        shell: bash
+        run: gh release edit "v${{ needs.detect.outputs.version }}" --draft=false
