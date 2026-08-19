@@ -688,3 +688,56 @@ describe("WebLLM retryLoad", () => {
     expect(session.lastLoadFailure!.modelId).toBe("M2-q4f16_1-MLC");
   });
 });
+
+describe("WebLLM deleteAllModelArtifacts", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    stubWebGPU();
+  });
+
+  it("deletes every cached model, unloads, and reports failures per model", async () => {
+    const deleted: string[] = [];
+    let unloaded = 0;
+    const cachedSet = new Set(["M1-q4f16_1-MLC", "M2-q4f16_1-MLC"]);
+    vi.doMock("@mlc-ai/web-llm", () => ({
+      CreateWebWorkerMLCEngine: async () => ({
+        reload: async () => {},
+        unload: async () => { unloaded++; },
+      }),
+      prebuiltAppConfig: {
+        model_list: [
+          { model_id: "M1-q4f16_1-MLC", vram_required_MB: 500, low_resource_required: true },
+          { model_id: "M2-q4f16_1-MLC", vram_required_MB: 900, low_resource_required: false },
+          { model_id: "M3-q4f16_1-MLC", vram_required_MB: 1200, low_resource_required: false },
+        ],
+      },
+      functionCallingModelIds: [],
+      hasModelInCache: async (id: string) => cachedSet.has(id),
+      deleteModelAllInfoInCache: async (id: string) => {
+        if (id === "M2-q4f16_1-MLC") throw new Error("locked");
+        cachedSet.delete(id);
+        deleted.push(id);
+      },
+    }));
+    const { createWebllmSession } = await import("../webllm.js");
+    const session = await createWebllmSession({
+      workerFactory: () => ({ terminate() {}, postMessage() {} } as unknown as Worker),
+    });
+    await session.ensureLoaded("M1-q4f16_1-MLC");
+
+    const result = await session.deleteAllModelArtifacts();
+
+    expect(deleted).toEqual(["M1-q4f16_1-MLC"]);
+    expect(result.deletedIds).toEqual(["M1-q4f16_1-MLC"]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].modelId).toBe("M2-q4f16_1-MLC");
+    expect(result.failures[0].message).toContain("locked");
+    // The loaded model was unloaded before the sweep.
+    expect(unloaded).toBe(1);
+    expect(session.isModelLoaded("M1-q4f16_1-MLC")).toBe(false);
+    // Cache state is re-queryable after the sweep: the model whose delete
+    // failed is still cached, the rest are gone.
+    const cached = await session.cachedModelIds();
+    expect(cached).toEqual(["M2-q4f16_1-MLC"]);
+  });
+});

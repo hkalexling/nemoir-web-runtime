@@ -58,7 +58,9 @@ runtime itself does not require React.
   produces a structured `WebLlmLoadFailure` (phase, failed URL,
   corrupt-cache flag). `retryLoad()` optionally deletes cached artifacts
   (`cleanCache`) and/or recreates the WebLLM worker (`freshWorker`).
-  `deleteModelArtifacts()` clears all cached model data.
+  `deleteModelArtifacts()` clears one model's cached artifacts;
+  `deleteAllModelArtifacts()` sweeps every model in the app's catalog,
+  unloading the current model and reporting per-model failures.
 - **Device capabilities + model fit.** `probeDeviceCapabilities()` probes
   WebGPU (shader-f16 support, storage buffer limit). `assessModelFit()`
   classifies each model (recommended, likely_ok, needs_download,

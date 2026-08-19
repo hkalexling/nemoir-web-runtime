@@ -173,6 +173,7 @@ export {
   type WebLlmLoadFailure,
   type WebLlmLoadPhase,
   type RetryLoadOptions,
+  type DeleteAllModelArtifactsResult,
 } from "./webllm.js";
 
 // Deterministic stage executor

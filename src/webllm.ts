@@ -134,6 +134,17 @@ export interface RetryLoadOptions {
   readonly freshWorker?: boolean;
 }
 
+/** Outcome of a `deleteAllModelArtifacts()` sweep. */
+export interface DeleteAllModelArtifactsResult {
+  /** Model ids whose cached artifacts were deleted. */
+  readonly deletedIds: readonly string[];
+  /** Per-model failures (the sweep continues past individual failures). */
+  readonly failures: ReadonlyArray<{
+    readonly modelId: string;
+    readonly message: string;
+  }>;
+}
+
 export interface WebLlmSession {
   /** LLM models available to load (embeddings filtered out). */
   readonly models: readonly WebLlmModelInfo[];
@@ -162,6 +173,14 @@ export interface WebLlmSession {
   retryLoad(modelId: string, opts?: RetryLoadOptions, signal?: AbortSignal): Promise<void>;
   /** Delete all cached artifacts for `modelId` (weights, wasm, config, tokenizer). */
   deleteModelArtifacts(modelId: string): Promise<void>;
+  /**
+   * Delete the cached artifacts of every model in the app's catalog
+   * (weights, wasm, config, tokenizer). Unloads the current model and
+   * recreates the worker on the next load, because WebLLM cannot safely
+   * delete artifacts of a loaded model. Best-effort per model: individual
+   * failures are reported in the result rather than aborting the sweep.
+   */
+  deleteAllModelArtifacts(): Promise<DeleteAllModelArtifactsResult>;
   /** Last classified load failure, or null if the last load succeeded. */
   readonly lastLoadFailure: WebLlmLoadFailure | null;
   /** Interrupt any in-flight generation. */
@@ -859,6 +878,53 @@ export class WebLlmSessionImpl implements WebLlmSession {
     };
     await webllm.deleteModelAllInfoInCache(modelId, appConfig);
     this.invalidateCachedState();
+  }
+
+  async deleteAllModelArtifacts(): Promise<DeleteAllModelArtifactsResult> {
+    const webllm = await loadWebllm();
+    await this.ensureModelList();
+
+    // WebLLM cannot safely delete artifacts of a loaded model. Unload and
+    // drop the worker, mirroring retryLoad's clean-cache recovery path; the
+    // next ensureLoaded() recreates a fresh worker.
+    await this.unloadCurrent();
+    if (this.worker) {
+      this.worker.terminate();
+      this.worker = undefined;
+    }
+    this.unhealthy = true;
+
+    const appConfig: AppConfig = {
+      model_list: [
+        ...webllm.prebuiltAppConfig.model_list,
+        ...(this.opts.extraModels ?? []),
+      ],
+      cacheBackend: this.cacheBackend,
+    };
+
+    const ids = this.modelInfos.map((m) => m.modelId);
+    const cachedResults = await Promise.all(
+      ids.map((id) =>
+        webllm.hasModelInCache(id, appConfig).catch(() => false),
+      ),
+    );
+    const cachedIds = ids.filter((_, i) => cachedResults[i]);
+
+    const deletedIds: string[] = [];
+    const failures: { modelId: string; message: string }[] = [];
+    for (const id of cachedIds) {
+      try {
+        await webllm.deleteModelAllInfoInCache(id, appConfig);
+        deletedIds.push(id);
+      } catch (e) {
+        failures.push({
+          modelId: id,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    this.invalidateCachedState();
+    return { deletedIds, failures };
   }
 
   // -----------------------------------------------------------------------
