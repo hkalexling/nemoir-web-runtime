@@ -52,6 +52,52 @@ export {
   type WorkflowEventSink,
 } from "./events.js";
 
+// Canonical JSON (RFC 8785) + NemoTrace audit recorder
+// (Phase 1: redacted single-file archives, no vault/replay yet).
+export {
+  canonicalStringify,
+  toCanonicalBytes,
+  parseJsonStrict,
+} from "./canonical.js";
+export {
+  TraceRecorder,
+  NoOpTraceRecorder,
+  NO_OP,
+  TraceError,
+  TRACE_FORMAT,
+  GRAPH_FORMAT,
+  SUMMARY_FORMAT,
+  CONTENT_IDENTITY_FORMAT,
+  PROVENANCE_FORMAT,
+  REDACTION_POLICY,
+  SCANNER_RULESET,
+  RUNTIME_NAME,
+  RUNTIME_VERSION,
+  MANIFEST_PATH,
+  GRAPH_PATH,
+  EVENTS_PATH,
+  SUMMARY_PATH,
+  INTEGRITY_PATH,
+  generateTraceId,
+  stableError,
+  incompleteProvenance,
+  safeModelDescriptor,
+  verifyGeneratedProvenance,
+  resolveRecorder,
+  resolveTraceRecorder,
+  writeArchive,
+  readArchiveEntries,
+  verifyArchive,
+  responseBytes,
+  sha256Hex,
+  type TraceConfig,
+  type TraceStatus,
+  type TraceValue,
+  type HostProvenance,
+  type ModelDescriptor,
+  type VerificationReport,
+} from "./trace.js";
+
 // Runtime types
 export {
   DEFAULT_RUN_OPTIONS,

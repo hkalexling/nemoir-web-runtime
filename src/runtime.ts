@@ -47,6 +47,11 @@ import {
 } from "./manifest.js";
 import { type RunOptions, type WorkflowResult, resolveRunOptions } from "./runtime-types.js";
 import { type ToolContext, type ToolRegistry } from "./tools.js";
+import {
+  type NoOpTraceRecorder,
+  TraceRecorder,
+  resolveRecorder,
+} from "./trace.js";
 
 // ---------------------------------------------------------------------------
 // Stage execution boundary
@@ -65,6 +70,11 @@ export interface StageContext {
     toolName?: string,
   ) => Promise<unknown>;
   readonly eventEmitter: WorkflowEventEmitter | null;
+  /**
+   * NemoTrace audit recorder (Phase 1). Null/undefined disables tracing;
+   * the runtime substitutes a no-op so execution paths stay identical.
+   */
+  readonly traceRecorder?: TraceRecorder | NoOpTraceRecorder | null;
 }
 
 export interface StageExecutor {
@@ -97,9 +107,26 @@ export function readDisplayKey(ref: { kind: string; name?: string; node?: string
  * Cycle-safe: tracks visited objects in a WeakSet so a cyclic value
  * returns `false` rather than overflowing the stack.
  */
+function hasLoneSurrogate(value: string): boolean {
+  // Lone surrogates are invalid UTF-8 / I-JSON. Detect unmatched lead/trail.
+  for (let i = 0; i < value.length; i += 1) {
+    const cu = value.charCodeAt(i);
+    if (cu >= 0xd800 && cu <= 0xdbff) {
+      // Lead surrogate must be followed by trail.
+      if (i + 1 >= value.length || value.charCodeAt(i + 1) < 0xdc00 || value.charCodeAt(i + 1) > 0xdfff) {
+        return true;
+      }
+      i += 1; // consume trail
+    } else if (cu >= 0xdc00 && cu <= 0xdfff) {
+      return true; // trail without lead
+    }
+  }
+  return false;
+}
+
 export function isJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean {
   if (value === null) return true;
-  if (typeof value === "string") return true;
+  if (typeof value === "string") return !hasLoneSurrogate(value);
   if (typeof value === "boolean") return true;
   if (typeof value === "number") return Number.isFinite(value);
   if (Array.isArray(value)) {
@@ -114,8 +141,9 @@ export function isJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean
     if (seen?.has(value)) return false;
     seen ??= new WeakSet();
     seen.add(value);
-    return Object.values(value as Record<string, unknown>).every((v) =>
-      isJsonSafeValue(v, seen),
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.every(
+      ([k, v]) => !hasLoneSurrogate(k) && isJsonSafeValue(v, seen),
     );
   }
   return false;
@@ -131,6 +159,11 @@ function validateWriteType(
     if (typeof value !== "string") {
       throw new StageOutputValidationError(
         `Stage '${stageId}' output field '${fieldName}': expected string, got ${typeof value}`,
+      );
+    }
+    if (hasLoneSurrogate(value)) {
+      throw new StageOutputValidationError(
+        `Stage '${stageId}' output field '${fieldName}': string contains invalid Unicode (lone surrogate)`,
       );
     }
   } else if (writeType === "bool") {
@@ -155,6 +188,11 @@ function validateWriteType(
     if (!value.every((v) => typeof v === "string")) {
       throw new StageOutputValidationError(
         `Stage '${stageId}' output field '${fieldName}': expected string[] but contains non-string elements`,
+      );
+    }
+    if (value.some((v) => hasLoneSurrogate(v as string))) {
+      throw new StageOutputValidationError(
+        `Stage '${stageId}' output field '${fieldName}': string contains invalid Unicode (lone surrogate)`,
       );
     }
   } else if (writeType === "json") {
@@ -258,10 +296,17 @@ function selectTransition(
   stage: StageSpec,
   inputs: Record<string, unknown>,
   stageOutputs: Record<string, Record<string, unknown>>,
+  recorder?: TraceRecorder | NoOpTraceRecorder | null,
+  stageVisitId?: string,
 ): { to: string; priority: number; reason: string } {
+  const rec = resolveRecorder(recorder);
   const sorted = [...stage.transitions].sort((a, b) => a.priority - b.priority);
+  const candidates: { to: string; priority: number; reason: string; matched: boolean }[] = [];
   for (const trans of sorted) {
-    if (evaluateGuard(trans.guard, inputs, stageOutputs)) {
+    const matched = evaluateGuard(trans.guard, inputs, stageOutputs);
+    candidates.push({ to: trans.to, priority: trans.priority, reason: trans.reason, matched });
+    if (matched) {
+      if (stageVisitId) rec.recordTransitionEvaluation(stageVisitId, candidates);
       return trans;
     }
   }
@@ -465,6 +510,7 @@ export class WorkflowRuntime {
     readable: Record<string, unknown>,
     options: RunOptions,
     emitter: WorkflowEventEmitter,
+    recorder?: TraceRecorder | NoOpTraceRecorder | null,
   ): StageContext {
     return {
       workflowId: this.manifest.workflowId,
@@ -474,8 +520,9 @@ export class WorkflowRuntime {
       allowedCapabilities: stage.requires,
       options,
       callTool: (capability, args, toolName) =>
-        this.enforceAndCall(stage, capability, args, inputs, options, emitter, toolName),
+        this.enforceAndCall(stage, capability, args, inputs, options, emitter, toolName, { recorder }),
       eventEmitter: emitter,
+      traceRecorder: recorder ?? null,
     };
   }
 
@@ -496,7 +543,7 @@ export class WorkflowRuntime {
     runOpts: RunOptions,
     emitter: WorkflowEventEmitter,
     toolName?: string,
-    opts?: { allowBefore?: boolean },
+    opts?: { allowBefore?: boolean; recorder?: TraceRecorder | NoOpTraceRecorder | null },
   ): Promise<unknown> {
     const allowBefore = opts?.allowBefore ?? true;
 
@@ -512,6 +559,7 @@ export class WorkflowRuntime {
       runOpts,
       emitter,
       toolName,
+      recorder: opts?.recorder,
     });
   }
 
@@ -525,9 +573,11 @@ export class WorkflowRuntime {
       runOpts: RunOptions;
       emitter: WorkflowEventEmitter;
       toolName?: string;
+      recorder?: TraceRecorder | NoOpTraceRecorder | null;
     },
   ): Promise<unknown> {
     const { allowBefore, runOpts, emitter, toolName } = opts;
+    const rec = resolveRecorder(opts.recorder);
     const policies = this.policiesByTrigger.get(capability) ?? [];
 
     // --- Tool preflight (before policies render UI / build messages) ---
@@ -585,7 +635,7 @@ export class WorkflowRuntime {
     for (const policy of policies) {
       if (policy.kind === "before" && allowBefore) {
         const boundArgs = bindTriggerArgs(policy.trigger, args, policy.id, capability);
-        if (emitter.hasSink) {
+        if (emitter.hasSink || emitter.hasObserver) {
           const requiredCaps = policy.requires.map((r) => r.capability);
           await emitter.emit("policy_checked", {
             stageId: stage.id,
@@ -616,7 +666,7 @@ export class WorkflowRuntime {
             runOpts,
             emitter,
             undefined,
-            { allowBefore: false },
+            { allowBefore: false, recorder: rec },
           );
           if (req.capability === "user.confirm" && result === false) {
             await emitter.emit("policy_denied", {
@@ -639,6 +689,10 @@ export class WorkflowRuntime {
       : this.tools.get(capability);
     const resolvedName = tool?.name ?? capability;
 
+    // Assign the trace tool-call id before the live event so the recorder
+    // can attribute the observed event deterministically.
+    const toolCallId = rec.beginToolCall(stage.id);
+
     await emitter.emit("tool_call_started", {
       stageId: stage.id,
       capability,
@@ -656,6 +710,7 @@ export class WorkflowRuntime {
 
     try {
       const result = await this.tools.call(capability, args, ctx, toolName);
+      rec.recordToolResult(toolCallId, result);
       await emitter.emit("tool_call_completed", {
         stageId: stage.id,
         capability,
@@ -664,6 +719,7 @@ export class WorkflowRuntime {
       });
       return result;
     } catch (e) {
+      rec.recordToolError(toolCallId, e);
       const errorMsg = e instanceof Error ? `${e.constructor.name}: ${e.message}` : String(e);
       await emitter.emit("tool_call_failed", {
         stageId: stage.id,
@@ -684,6 +740,7 @@ export class WorkflowRuntime {
     opts?: {
       options?: Partial<RunOptions>;
       eventSink?: WorkflowEventSink | null;
+      traceRecorder?: TraceRecorder | NoOpTraceRecorder | null;
     },
   ): Promise<WorkflowResult> {
     const options = resolveRunOptions(opts?.options);
@@ -691,11 +748,24 @@ export class WorkflowRuntime {
     let currentId = this.manifest.entryStageId;
     let steps = 0;
     const runId = generateRunId();
-    const emitter = new WorkflowEventEmitter(runId, opts?.eventSink ?? null);
+    const rec = resolveRecorder(opts?.traceRecorder);
+    rec.beginRun(this.manifest);
+    // Trace observer does not count as a live sink, so provider streaming
+    // stays gated on a real caller consumer.
+    const userSink = opts?.eventSink ?? null;
+    const observer: import("./events.js").WorkflowEventObserver | null =
+      opts?.traceRecorder instanceof TraceRecorder
+        ? (event) => rec.observeWorkflowEvent(event)
+        : null;
+    const emitter = new WorkflowEventEmitter(runId, userSink, observer);
 
     await emitter.emit("run_started", {
       metadata: { workflowId: this.manifest.workflowId, entry: currentId },
     });
+
+    // Set once the success path finalizes, so a finalization failure itself
+    // never triggers a second terminal event/finalization below.
+    let finalized = false;
 
     try {
       while (true) {
@@ -710,7 +780,8 @@ export class WorkflowRuntime {
 
         const stage = this.requireStage(currentId);
         const readable = resolveReads(stage, inputs, stageOutputs);
-        const ctx = this.makeStageContext(stage, inputs, readable, options, emitter);
+        const ctx = this.makeStageContext(stage, inputs, readable, options, emitter, rec);
+        const visitId = rec.beginStageVisit(stage.id);
 
         await emitter.emit("stage_started", { stageId: stage.id });
 
@@ -739,10 +810,12 @@ export class WorkflowRuntime {
             },
           };
           await emitter.emit("run_completed", { result });
+          finalized = true;
+          await rec.finishRun("complete");
           return result;
         }
 
-        const selected = selectTransition(stage, inputs, stageOutputs);
+        const selected = selectTransition(stage, inputs, stageOutputs, rec, visitId);
         await emitter.emit("transition_selected", {
           stageId: stage.id,
           transitionTo: selected.to,
@@ -751,11 +824,26 @@ export class WorkflowRuntime {
         currentId = selected.to;
       }
     } catch (error) {
+      if (finalized) throw error;
+      if (options.signal?.aborted) {
+        // Cancellation: finalize as interrupted without a live failure
+        // event, and never mask the original error.
+        await rec.finishRun("interrupted").catch(() => {});
+        throw error;
+      }
+      rec.recordRunError(error);
       const errorMsg = error instanceof Error ? error.message : String(error);
       await emitter.emit("run_failed", {
         error: errorMsg,
         metadata: { reason: error instanceof Error ? error.constructor.name : "Error" },
       });
+      // A blocked finalization is loud; preserve the original as the cause.
+      try {
+        await rec.finishRun("failed");
+      } catch (finishError) {
+        (finishError as Error).cause = error;
+        throw finishError;
+      }
       throw error;
     }
   }
@@ -768,7 +856,7 @@ export class WorkflowRuntime {
    */
   async *stream(
     inputs: Record<string, unknown>,
-    opts?: { options?: Partial<RunOptions> },
+    opts?: { options?: Partial<RunOptions>; traceRecorder?: TraceRecorder | NoOpTraceRecorder | null },
   ): AsyncIterable<WorkflowEvent> {
     const callerOptions = resolveRunOptions(opts?.options);
     // Compose the caller's signal with an internal controller so that an
@@ -800,7 +888,7 @@ export class WorkflowRuntime {
     };
 
     // Run in the background
-    const runPromise = this.run(inputs, { options, eventSink: sink })
+    const runPromise = this.run(inputs, { options, eventSink: sink, traceRecorder: opts?.traceRecorder ?? null })
       .catch((e) => {
         runError = e;
       })

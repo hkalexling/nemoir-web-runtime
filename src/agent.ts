@@ -34,6 +34,8 @@ import {
   type Tool,
 } from "./tools.js";
 import type { WebUiHost } from "./ui-host.js";
+import type { NoOpTraceRecorder, TraceRecorder } from "./trace.js";
+import { type TraceValue, resolveTraceRecorder } from "./trace.js";
 
 // ---------------------------------------------------------------------------
 // Agent options
@@ -59,6 +61,12 @@ export interface WorkflowAgentOptions {
   browserTools?: BrowserToolsOptions;
   /** Default run options (can be overridden per run). */
   defaults?: Partial<RunOptions>;
+  /**
+   * NemoTrace audit value: a `TraceConfig`, an existing `TraceRecorder`,
+   * a per-run factory, or null/undefined (tracing disabled). The generated
+   * facade resolves configs against its verified IR provenance.
+   */
+  trace?: TraceValue;
   /**
    * Model action protocol. Defaults to "native" (adapter returns
    * `ModelResponse.toolCalls`). WebLLM and other small/local models should
@@ -150,6 +158,8 @@ export class WorkflowAgent {
   private readonly modelAdapter?: ModelAdapter | ModelRouter;
   private readonly defaults?: Partial<RunOptions>;
   private readonly actionProtocol?: ActionProtocol;
+  private readonly trace?: TraceValue;
+  private lastRecorder: TraceRecorder | NoOpTraceRecorder | null = null;
 
   constructor(rawIr: unknown, opts: WorkflowAgentOptions) {
     // Decode + web-validate the raw IR
@@ -196,10 +206,21 @@ export class WorkflowAgent {
     }
 
     this.defaults = opts.defaults;
+    this.trace = opts.trace;
   }
 
   get workflowId(): string {
     return this.manifest.workflowId;
+  }
+
+  /**
+   * The recorder used by the most recent `run()`/`stream()` call, if any.
+   * Browser hosts read `lastTraceRecorder?.archiveBytes` after a run and
+   * wrap the bytes in a `Blob` for user-gesture export. Null when tracing
+   * was disabled or no run has completed yet.
+   */
+  get lastTraceRecorder(): TraceRecorder | NoOpTraceRecorder | null {
+    return this.lastRecorder;
   }
 
   get requiredCapabilities(): ReadonlySet<string> {
@@ -214,12 +235,16 @@ export class WorkflowAgent {
     opts?: {
       options?: Partial<RunOptions>;
       eventSink?: import("./events.js").WorkflowEventSink | null;
+      trace?: TraceValue;
     },
   ): Promise<WorkflowResult> {
     const runtime = this.createRuntime(opts?.options);
+    const traceRecorder = resolveTraceRecorder(opts?.trace ?? this.trace ?? null);
+    this.lastRecorder = traceRecorder;
     return runtime.run(inputs, {
       options: opts?.options,
       eventSink: opts?.eventSink,
+      traceRecorder,
     });
   }
 
@@ -228,10 +253,12 @@ export class WorkflowAgent {
    */
   async *stream(
     inputs: Record<string, unknown>,
-    opts?: { options?: Partial<RunOptions> },
+    opts?: { options?: Partial<RunOptions>; trace?: TraceValue },
   ): AsyncIterable<WorkflowEvent> {
     const runtime = this.createRuntime(opts?.options);
-    yield* runtime.stream(inputs, { options: opts?.options });
+    const traceRecorder = resolveTraceRecorder(opts?.trace ?? this.trace ?? null);
+    this.lastRecorder = traceRecorder;
+    yield* runtime.stream(inputs, { options: opts?.options, traceRecorder });
   }
 
   private createRuntime(options?: Partial<RunOptions>): WorkflowRuntime {

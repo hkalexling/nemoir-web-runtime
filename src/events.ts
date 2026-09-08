@@ -58,14 +58,22 @@ export type WorkflowEventSink = (event: WorkflowEvent) => Promise<void> | void;
  * The emitter is cheap when the sink is `null`: `emit()` still constructs
  * and returns the event (for tests) but no I/O happens.
  */
+export type WorkflowEventObserver = (event: WorkflowEvent) => unknown | Promise<unknown>;
+
 export class WorkflowEventEmitter {
   private _seq = 0;
   private readonly _runId: string;
   private readonly _sink: WorkflowEventSink | null;
+  private readonly _observer: WorkflowEventObserver | null;
 
-  constructor(runId: string, sink?: WorkflowEventSink | null) {
+  constructor(
+    runId: string,
+    sink?: WorkflowEventSink | null,
+    observer?: WorkflowEventObserver | null,
+  ) {
     this._runId = runId;
     this._sink = sink ?? null;
+    this._observer = observer ?? null;
   }
 
   get runId(): string {
@@ -81,6 +89,15 @@ export class WorkflowEventEmitter {
     return this._sink !== null;
   }
 
+  /** Live-consumer check that ignores the trace observer (streaming gate). */
+  get hasLiveSink(): boolean {
+    return this._sink !== null;
+  }
+
+  get hasObserver(): boolean {
+    return this._observer !== null;
+  }
+
   async emit(
     kind: WorkflowEventKind,
     fields: Omit<WorkflowEvent, "kind" | "runId" | "sequence" | "timestamp"> = {},
@@ -93,6 +110,14 @@ export class WorkflowEventEmitter {
       timestamp: new Date().toISOString(),
       ...fields,
     };
+    if (this._observer !== null) {
+      try {
+        await this._observer(event);
+      } catch {
+        // Observer failures must not change workflow outcome or prevent
+        // the live sink from receiving the event.
+      }
+    }
     if (this._sink !== null) {
       await this._sink(event);
     }

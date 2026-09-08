@@ -52,6 +52,12 @@ import type { WriteSpec } from "./manifest.js";
 import type { ModelStageOutputValidators } from "./runtime-types.js";
 import type { Tool, ToolParamType } from "./tools.js";
 import type { WorkflowEventEmitter } from "./events.js";
+import {
+  type NoOpTraceRecorder,
+  type TraceRecorder,
+  resolveRecorder,
+  responseBytes,
+} from "./trace.js";
 
 // ---------------------------------------------------------------------------
 // Action protocol types
@@ -132,13 +138,24 @@ export function normalizeStageOutput(
   return result;
 }
 
+function hasLoneSurrogateModel(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const cu = value.charCodeAt(i);
+    if (cu >= 0xd800 && cu <= 0xdbff) {
+      if (i + 1 >= value.length || value.charCodeAt(i + 1) < 0xdc00 || value.charCodeAt(i + 1) > 0xdfff) return true;
+      i += 1;
+    } else if (cu >= 0xdc00 && cu <= 0xdfff) return true;
+  }
+  return false;
+}
+
 /**
  * Recursively check that a value is JSON-safe for model-output validation.
  * Cycle-safe (see `isJsonSafeValue`).
  */
 function isModelJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean {
   if (value === null) return true;
-  if (typeof value === "string") return true;
+  if (typeof value === "string") return !hasLoneSurrogateModel(value);
   if (typeof value === "boolean") return true;
   if (typeof value === "number") return Number.isFinite(value);
   if (Array.isArray(value)) {
@@ -152,8 +169,8 @@ function isModelJsonSafeValue(value: unknown, seen?: WeakSet<object>): boolean {
     if (seen?.has(value)) return false;
     seen ??= new WeakSet();
     seen.add(value);
-    return Object.values(value as Record<string, unknown>).every((v) =>
-      isModelJsonSafeValue(v, seen),
+    return Object.entries(value as Record<string, unknown>).every(
+      ([k, v]) => !hasLoneSurrogateModel(k) && isModelJsonSafeValue(v, seen),
     );
   }
   return false;
@@ -169,6 +186,11 @@ function normalizeWriteValue(
       if (typeof val !== "string") {
         throw new ModelOutputValidationError(
           `expected string for '${write.name}' in stage '${stageId}', got ${typeof val}`,
+        );
+      }
+      if (hasLoneSurrogateModel(val)) {
+        throw new ModelOutputValidationError(
+          `expected string for '${write.name}' in stage '${stageId}' (lone surrogate)`,
         );
       }
       return val;
@@ -190,6 +212,11 @@ function normalizeWriteValue(
       if (!Array.isArray(val) || !val.every((v) => typeof v === "string")) {
         throw new ModelOutputValidationError(
           `expected string[] for '${write.name}' in stage '${stageId}'`,
+        );
+      }
+      if ((val as string[]).some((v) => hasLoneSurrogateModel(v))) {
+        throw new ModelOutputValidationError(
+          `expected string[] for '${write.name}' in stage '${stageId}' (lone surrogate)`,
         );
       }
       return [...val];
@@ -742,8 +769,11 @@ export class ModelStageExecutor implements StageExecutor {
     const emitter = ctx.eventEmitter;
     const useStreaming =
       emitter !== null &&
-      emitter.hasSink &&
+      (emitter.hasLiveSink ?? emitter.hasSink) &&
       supportsStreaming(adapter);
+    // NemoTrace: capture final-response evidence regardless of live
+    // streaming. The recorder stores counts/bytes only, never text.
+    const rec = resolveRecorder(ctx.traceRecorder ?? null);
 
     let toolRounds = 0;
     // eslint-disable-next-line no-constant-condition
@@ -763,11 +793,17 @@ export class ModelStageExecutor implements StageExecutor {
       };
 
       let response: ModelResponse;
+      // Each attempt gets its own trace model-call id.
+      const modelCallId = rec.beginModelCall(ctx.stage.id);
       try {
         if (useStreaming && emitter) {
-          response = await this.streamAdapterResponse(adapter, request, ctx, emitter);
+          response = await this.streamAdapterResponse(adapter, request, ctx, emitter, rec, modelCallId);
         } else {
           response = await adapter.complete(request);
+          rec.recordModelResponse(modelCallId, {
+            responseBytes: responseBytes(response),
+            toolCallCount: response.toolCalls?.length ?? 0,
+          });
           if (emitter) {
             await emitter.emit("model_completed", { stageId: ctx.stage.id });
           }
@@ -1092,10 +1128,19 @@ export class ModelStageExecutor implements StageExecutor {
     request: ModelRequest,
     ctx: StageContext,
     emitter: WorkflowEventEmitter,
+    recorder?: TraceRecorder | NoOpTraceRecorder | null,
+    modelCallId?: string,
   ): Promise<ModelResponse> {
+    const rec = resolveRecorder(recorder ?? null);
     if (!adapter.stream) {
       // Fall back to complete() if streaming not available
       const resp = await adapter.complete(request);
+      if (modelCallId) {
+        rec.recordModelResponse(modelCallId, {
+          responseBytes: responseBytes(resp),
+          toolCallCount: resp.toolCalls?.length ?? 0,
+        });
+      }
       await emitter.emit("model_completed", { stageId: ctx.stage.id });
       return resp;
     }
@@ -1109,6 +1154,12 @@ export class ModelStageExecutor implements StageExecutor {
         });
       } else if (chunk.kind === "completed") {
         finalResponse = chunk.response ?? null;
+        if (finalResponse && modelCallId) {
+          rec.recordModelResponse(modelCallId, {
+            responseBytes: responseBytes(finalResponse),
+            toolCallCount: finalResponse.toolCalls?.length ?? 0,
+          });
+        }
         await emitter.emit("model_completed", { stageId: ctx.stage.id });
       }
     }
