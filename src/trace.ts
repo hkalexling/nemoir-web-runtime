@@ -109,6 +109,19 @@ export function incompleteProvenance(): HostProvenance {
   };
 }
 
+export interface StageCompletedInfo {
+  readonly stageId: string;
+  readonly stageVisitId: string;
+  readonly sequence: number;
+}
+
+export interface StageAnnotationSpec {
+  readonly namespace: string;
+  readonly kind: string;
+  readonly payload: unknown;
+  readonly anchorSequence?: number;
+}
+
 export interface TraceConfig {
   readonly profile?: string;
   readonly provenance?: HostProvenance;
@@ -125,6 +138,12 @@ export interface TraceConfig {
   readonly traceId?: string;
   /** Test hook: fixed clock for byte-identical fixtures. */
   readonly clock?: () => Date;
+  /**
+   * Narrow synchronous host hook invoked immediately after a successfully
+   * observed `stage_completed` (Phase 3). Receives only stage/visit/sequence
+   * and may return one annotation spec or null. Failures never break a run.
+   */
+  readonly onStageCompleted?: (info: StageCompletedInfo) => StageAnnotationSpec | null | undefined;
 }
 
 export interface VerificationReport {
@@ -439,6 +458,187 @@ export async function verifyGeneratedProvenance(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Trusted autoresearch annotation validation (Phase 3)
+// ---------------------------------------------------------------------------
+
+export const ANNOTATION_NAMESPACE = "nemoir.autoresearch/v1";
+export const ANNOTATION_KIND = "trial_finished";
+
+const ANNOTATION_VERDICTS = new Set(["accepted", "rejected", "inconclusive"]);
+
+const ANNOTATION_REASONS = new Set([
+  "accepted",
+  "no_change",
+  "duplicate",
+  "preflight_integrity",
+  "preflight_scope",
+  "preflight_static_scan",
+  "preflight_build",
+  "preflight_smoke",
+  "preflight_sanitizer",
+  "selection_correctness",
+  "selection_noise",
+  "selection_tail_regression",
+  "confirmation_correctness",
+  "confirmation_noise",
+  "confirmation_tail_regression",
+  "no_improvement",
+  "full_sanitizer",
+  "no_evaluation",
+  "policy_denied",
+  "tool_failed",
+  "budget_exhausted",
+  "other",
+]);
+
+const ANNOTATION_METRIC_NUMBERS = new Set([
+  "candidate_median_ns",
+  "incumbent_median_ns",
+  "delta_ns",
+  "effect_ns",
+  "speedup_pct",
+  "candidate_spread_pct",
+  "p95_regression_pct",
+  "cold_regression_pct",
+]);
+
+const ANNOTATION_METRIC_BOOLS = new Set(["valid", "noise_ok", "regressions_ok"]);
+
+const ANNOTATION_REQUIRED = new Set([
+  "trial_id",
+  "candidate_ref",
+  "verdict",
+  "reason_code",
+  "selection_metrics",
+  "artifact_refs",
+]);
+
+const ANNOTATION_ALLOWED = new Set([
+  "trial_id",
+  "candidate_ref",
+  "parent_ref",
+  "candidate_digest",
+  "parent_digest",
+  "selection_metrics",
+  "confirmation_metrics",
+  "verdict",
+  "reason_code",
+  "source_reason_code",
+  "mechanism_ref",
+  "mechanism_id",
+  "artifact_refs",
+]);
+
+function validateAutoresearchMetrics(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TraceError(`trial_finished payload has invalid ${field}: must be an object`);
+  }
+  const mapping = { ...(value as Record<string, unknown>) };
+  for (const key of Object.keys(mapping)) {
+    if (!ANNOTATION_METRIC_NUMBERS.has(key) && !ANNOTATION_METRIC_BOOLS.has(key)) {
+      throw new TraceError(`trial_finished payload has unknown metrics field ${JSON.stringify(key)} in ${field}`);
+    }
+  }
+  for (const key of ANNOTATION_METRIC_NUMBERS) {
+    if (!(key in mapping)) continue;
+    const number = mapping[key];
+    if (typeof number !== "number" || !Number.isFinite(number)) {
+      throw new TraceError(`trial_finished payload has invalid ${field}.${key}: must be a finite number`);
+    }
+    if (Number.isInteger(number) && !Number.isSafeInteger(number)) {
+      throw new TraceError(`trial_finished payload has unsafe integer ${field}.${key}`);
+    }
+  }
+  for (const key of ANNOTATION_METRIC_BOOLS) {
+    if (!(key in mapping)) continue;
+    if (typeof mapping[key] !== "boolean") {
+      throw new TraceError(`trial_finished payload has invalid ${field}.${key}: must be a boolean`);
+    }
+  }
+  return mapping;
+}
+
+export function validateAutoresearchPayload(payload: unknown): Record<string, unknown> {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TraceError("trial_finished payload must be an object");
+  }
+  const data: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  for (const key of Object.keys(data)) {
+    if (!ANNOTATION_ALLOWED.has(key)) {
+      throw new TraceError(`trial_finished payload has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of ANNOTATION_REQUIRED) {
+    if (!(key in data)) {
+      throw new TraceError(`trial_finished payload is missing field ${JSON.stringify(key)}`);
+    }
+  }
+  const trialId = data.trial_id;
+  if (typeof trialId !== "number" || !Number.isInteger(trialId) || !Number.isSafeInteger(trialId) || trialId < 1) {
+    throw new TraceError(`trial_finished payload has invalid trial_id ${JSON.stringify(trialId)}`);
+  }
+  if (typeof data.candidate_ref !== "string" || !/^candidate-[1-9][0-9]*$/.test(data.candidate_ref)) {
+    throw new TraceError(`trial_finished payload has invalid candidate_ref ${JSON.stringify(data.candidate_ref)}`);
+  }
+  const parentRef = data.parent_ref;
+  if (parentRef !== undefined && parentRef !== null) {
+    if (typeof parentRef !== "string" || !/^candidate-[1-9][0-9]*$/.test(parentRef)) {
+      throw new TraceError(`trial_finished payload has invalid parent_ref ${JSON.stringify(parentRef)}`);
+    }
+  }
+  for (const digestKey of ["candidate_digest", "parent_digest"] as const) {
+    const digest = data[digestKey];
+    if (digest !== undefined && digest !== null) {
+      if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+        throw new TraceError(`trial_finished payload has invalid ${digestKey} ${JSON.stringify(digest)}`);
+      }
+    }
+  }
+  data.selection_metrics = validateAutoresearchMetrics(data.selection_metrics, "selection_metrics");
+  if (data.confirmation_metrics !== undefined && data.confirmation_metrics !== null) {
+    data.confirmation_metrics = validateAutoresearchMetrics(data.confirmation_metrics, "confirmation_metrics");
+  }
+  if (!ANNOTATION_VERDICTS.has(data.verdict as string)) {
+    throw new TraceError(`trial_finished payload has invalid verdict ${JSON.stringify(data.verdict)}`);
+  }
+  if (!ANNOTATION_REASONS.has(data.reason_code as string)) {
+    throw new TraceError(`trial_finished payload has invalid reason_code ${JSON.stringify(data.reason_code)}`);
+  }
+  const sourceReason = data.source_reason_code;
+  if (sourceReason !== undefined && sourceReason !== null) {
+    if (typeof sourceReason !== "string" || sourceReason.length > 64 || !/^[a-z0-9][a-z0-9_-]*$/.test(sourceReason)) {
+      throw new TraceError(`trial_finished payload has invalid source_reason_code ${JSON.stringify(sourceReason)}`);
+    }
+  }
+  const mechanismRef = data.mechanism_ref;
+  if (mechanismRef !== undefined && mechanismRef !== null) {
+    if (typeof mechanismRef !== "string" || !/^mechanism-[1-9][0-9]*$/.test(mechanismRef)) {
+      throw new TraceError(`trial_finished payload has invalid mechanism_ref ${JSON.stringify(mechanismRef)}`);
+    }
+  }
+  const mechanismId = data.mechanism_id;
+  if (mechanismId !== undefined && mechanismId !== null) {
+    if (typeof mechanismId !== "string" || mechanismId.length < 1 || mechanismId.length > 128) {
+      throw new TraceError("trial_finished payload has invalid mechanism_id");
+    }
+  }
+  const artifactRefs = data.artifact_refs;
+  if (!Array.isArray(artifactRefs)) {
+    throw new TraceError("trial_finished payload has invalid artifact_refs: must be an array");
+  }
+  if (new Set(artifactRefs).size !== artifactRefs.length) {
+    throw new TraceError("trial_finished payload has duplicate artifact_refs");
+  }
+  for (const ref of artifactRefs) {
+    if (typeof ref !== "string" || !/^artifact-[1-9][0-9]*$/.test(ref)) {
+      throw new TraceError(`trial_finished payload has invalid artifact_ref ${JSON.stringify(ref)}`);
+    }
+  }
+  data.artifact_refs = [...artifactRefs];
+  return data;
+}
+
 /** Build a safe model descriptor from a host adapter/spec (allowlist only). */
 export function safeModelDescriptor(model: unknown): ModelDescriptor | null {
   let name: unknown = null;
@@ -487,6 +687,7 @@ interface RecorderConfig {
   readonly secrets: readonly string[];
   readonly traceId: string;
   readonly clock: () => Date;
+  readonly onStageCompleted?: (info: StageCompletedInfo) => StageAnnotationSpec | null | undefined;
 }
 
 function normalizeConfig(config: TraceConfig = {}): RecorderConfig {
@@ -518,6 +719,7 @@ function normalizeConfig(config: TraceConfig = {}): RecorderConfig {
     secrets: config.secrets ?? [],
     traceId,
     clock: config.clock ?? (() => new Date()),
+    onStageCompleted: config.onStageCompleted,
   };
 }
 
@@ -535,6 +737,11 @@ export class TraceRecorder {
   private readonly pendingTools = new Map<string, string[]>();
   private readonly openTools = new Map<string, string[]>();
   private currentVisit: string | null = null;
+  private currentStageId: string | null = null;
+  private readonly visitToStage = new Map<string, string>();
+  private readonly visitSequences = new Map<string, number[]>();
+  private annotationsDropped = 0;
+  private readonly annotationWarnings: string[] = [];
   private readonly modelBytes = new Map<string, number>();
   private readonly toolStartedAt = new Map<string, Date>();
   private readonly toolResultTypes = new Map<string, string>();
@@ -556,6 +763,14 @@ export class TraceRecorder {
 
   get traceId(): string {
     return this.config.traceId;
+  }
+
+  get droppedAnnotations(): number {
+    return this.annotationsDropped;
+  }
+
+  get droppedAnnotationWarnings(): readonly string[] {
+    return [...this.annotationWarnings];
   }
 
   /** Finalized ZIP bytes (set by finishRun; null before). Lets hosts that
@@ -610,6 +825,8 @@ export class TraceRecorder {
     queue.push(visitId);
     this.pendingVisits.set(stageId, queue);
     this.currentVisit = visitId;
+    this.currentStageId = stageId;
+    this.visitToStage.set(visitId, stageId);
     return visitId;
   }
 
@@ -668,13 +885,92 @@ export class TraceRecorder {
     this.transitionEvidence.push({ stageVisitId, candidates: [...candidates] });
   }
 
-  /** Trusted domain annotations land in Phase 3; refuse loudly until then. */
-  recordAnnotation(namespace: string, kind: string, _payload?: unknown, _anchorSequence?: number): void {
+  /**
+   * Persist one trusted domain annotation (Phase 3). Known
+   * `nemoir.autoresearch/v1` / `trial_finished` payloads are strictly
+   * validated; unknown namespaces retain only namespace/kind with a redacted
+   * payload marker. Returns the persisted record, or null when the scanner
+   * forces omission. Throws on malformed known payloads or missing context.
+   */
+  recordAnnotation(
+    namespace: string,
+    kind: string,
+    payload?: unknown,
+    anchorSequence?: number,
+    opts: { stageId?: string; stageVisitId?: string } = {},
+  ): Record<string, unknown> | null {
     this.requireBegun();
-    throw new TraceError(
-      `trace annotations (${namespace}/${kind}) arrive in Phase 3; ` +
-        `the Phase 1 audit recorder cannot persist them`,
-    );
+    if (this.eventLimitExceeded || this.events.length >= LIMIT_EVENT_COUNT) {
+      this.eventLimitExceeded = true;
+      return null;
+    }
+    const visit = opts.stageVisitId ?? this.currentVisit;
+    const stage = opts.stageId ?? (visit !== null ? (this.visitToStage.get(visit) ?? this.currentStageId) : null);
+    if (visit === null || stage === null || stage === undefined) {
+      throw new TraceError("trace annotation requires an enclosing stage visit");
+    }
+    if (!/^s-[1-9][0-9]*$/.test(visit)) {
+      throw new TraceError(`trace annotation has invalid stage_visit_id ${JSON.stringify(visit)}`);
+    }
+    if (typeof stage !== "string" || stage.length < 1 || stage.length > 256) {
+      throw new TraceError(`trace annotation has invalid stage_id ${JSON.stringify(stage)}`);
+    }
+    if (anchorSequence !== undefined && anchorSequence !== null) {
+      if (typeof anchorSequence !== "number" || !Number.isInteger(anchorSequence) || !Number.isSafeInteger(anchorSequence) || anchorSequence < 1) {
+        throw new TraceError(`trace annotation has invalid anchor_sequence ${JSON.stringify(anchorSequence)}`);
+      }
+      const known = this.visitSequences.get(visit) ?? [];
+      if (known.length > 0 && !known.includes(anchorSequence)) {
+        throw new TraceError(`trace annotation anchor_sequence ${JSON.stringify(anchorSequence)} does not belong to visit ${JSON.stringify(visit)}`);
+      }
+    }
+    let projectedPayload: unknown;
+    if (namespace === ANNOTATION_NAMESPACE && kind === ANNOTATION_KIND) {
+      if (payload === undefined || payload === null) {
+        throw new TraceError("trial_finished annotation requires a payload mapping");
+      }
+      projectedPayload = validateAutoresearchPayload(payload);
+      // Audit policy gate (redaction-policy §11): digests and raw mechanism
+      // IDs require explicit publication review; audit keeps opaque refs only.
+      if (this.config.profile === "audit" && typeof projectedPayload === "object" && projectedPayload !== null && !Array.isArray(projectedPayload)) {
+        const pp = projectedPayload as Record<string, unknown>;
+        if (pp.candidate_digest !== null && pp.candidate_digest !== undefined) {
+          throw new TraceError("audit profile rejects non-null candidate_digest (requires publication review)");
+        }
+        if (pp.parent_digest !== null && pp.parent_digest !== undefined) {
+          throw new TraceError("audit profile rejects non-null parent_digest (requires publication review)");
+        }
+        if (pp.mechanism_id !== null && pp.mechanism_id !== undefined) {
+          throw new TraceError("audit profile rejects non-null mechanism_id (requires publication review)");
+        }
+      }
+    } else {
+      projectedPayload = this.newMarker("unapproved_field", payload ?? {});
+    }
+    const record: Record<string, unknown> = {
+      kind: "annotation",
+      run_id: this.config.traceId,
+      timestamp: this.config.clock().toISOString(),
+      stage_id: stage,
+      stage_visit_id: visit,
+      annotation: { namespace, kind, payload: projectedPayload },
+      redacted_fields: [],
+    };
+    if (anchorSequence !== undefined && anchorSequence !== null) {
+      record.anchor_sequence = anchorSequence;
+    }
+    if (projectedPayload !== null && typeof projectedPayload === "object" && !Array.isArray(projectedPayload) && "$redacted" in (projectedPayload as Record<string, unknown>)) {
+      record.redacted_fields = ["/annotation/payload"];
+    }
+    if (this.applyRegistry(record)) return null;
+    if (this.scanAndMask(record)) return null;
+    record.redacted_fields = [...new Set(record.redacted_fields as string[])].sort();
+    if (this.events.length >= LIMIT_EVENT_COUNT) {
+      this.eventLimitExceeded = true;
+      return null;
+    }
+    this.events.push(record);
+    return record;
   }
 
   /** Capture the terminal failure's stable taxonomy (no message). */
@@ -706,7 +1002,70 @@ export class TraceRecorder {
       return null;
     }
     this.events.push(record);
+    const visitSeq = (record as Record<string, unknown>).stage_visit_id;
+    if (typeof visitSeq === "string" && typeof event.sequence === "number" && Number.isInteger(event.sequence) && event.sequence >= 1) {
+      const arr = this.visitSequences.get(visitSeq) ?? [];
+      arr.push(event.sequence);
+      this.visitSequences.set(visitSeq, arr);
+    }
+    if ((record as Record<string, unknown>).kind === "stage_completed") {
+      this.maybeEmitStageAnnotation(record, event);
+    }
     return record;
+  }
+
+  private recordAnnotationWarning(record: Record<string, unknown>, reason: string): void {
+    this.annotationsDropped += 1;
+    if (this.annotationWarnings.length >= 10) return;
+    const stage = record.stage_id;
+    const stageStr = typeof stage === "string" ? stage : "unknown";
+    const safe = reason === "hook_failed" || reason === "invalid_spec" || reason === "invalid_payload" ? reason : "invalid_payload";
+    this.annotationWarnings.push(`${stageStr}:${safe}`);
+  }
+
+  private maybeEmitStageAnnotation(record: Record<string, unknown>, event: WorkflowEvent): void {
+    const hook = this.config.onStageCompleted;
+    if (!hook || this.finished) return;
+    let spec: StageAnnotationSpec | null | undefined;
+    try {
+      spec = hook({
+        stageId: record.stage_id as string,
+        stageVisitId: record.stage_visit_id as string,
+        sequence: event.sequence,
+      });
+    } catch {
+      this.recordAnnotationWarning(record, "hook_failed");
+      return;
+    }
+    if (!spec) return;
+    try {
+      if (typeof spec !== "object" || spec === null) {
+        this.recordAnnotationWarning(record, "invalid_spec");
+        return;
+      }
+      const { namespace, kind, payload } = spec as StageAnnotationSpec;
+      if (typeof namespace !== "string" || typeof kind !== "string") {
+        this.recordAnnotationWarning(record, "invalid_spec");
+        return;
+      }
+      if (payload === undefined || payload === null || typeof payload !== "object") {
+        this.recordAnnotationWarning(record, "invalid_payload");
+        return;
+      }
+      // Force anchor to the triggering sequence; never trust hook anchor.
+      const triggering = event.sequence;
+      const anchor = typeof triggering === "number" && Number.isInteger(triggering) && triggering >= 1 ? triggering : undefined;
+      const persisted = this.recordAnnotation(namespace, kind, payload, anchor, {
+        stageId: record.stage_id as string,
+        stageVisitId: record.stage_visit_id as string,
+      });
+      if (persisted === null) {
+        this.recordAnnotationWarning(record, "invalid_payload");
+      }
+    } catch {
+      this.recordAnnotationWarning(record, "invalid_payload");
+      return;
+    }
   }
 
   // -- internals --------------------------------------------------------
@@ -743,6 +1102,8 @@ export class TraceRecorder {
       visit = `s-${this.visitCount}`;
     }
     this.currentVisit = visit;
+    this.currentStageId = stageId;
+    this.visitToStage.set(visit, stageId);
     return visit;
   }
 
@@ -916,8 +1277,16 @@ export class TraceRecorder {
   private projectModelRetry(event: WorkflowEvent): Record<string, unknown> {
     const visit = this.currentOrNewVisit();
     const record = this.base(event, { stageVisitId: visit });
-    const callId = this.peekModel(visit);
-    if (callId !== null) record.model_call_id = callId;
+    // The schema requires model_call_id on every model_retry. A retry can
+    // legally arrive with no pending call (e.g. a tool-error retry emitted
+    // after model_completed consumed the call id), so synthesize a fresh
+    // run-local id rather than emitting a schema-invalid record.
+    let callId = this.peekModel(visit);
+    if (callId === null) {
+      this.modelCount += 1;
+      callId = `m-${this.modelCount}`;
+    }
+    record.model_call_id = callId;
     const metadata = (event.metadata ?? {}) as Record<string, unknown>;
     record.metadata = {
       attempt: safeInt(metadata.attempt, 1, 1),
@@ -1383,6 +1752,8 @@ export class TraceRecorder {
       stage_visit_count: visits.size,
       duration_ms: Math.max(0, finishTime.getTime() - beginTime.getTime()),
       counts_by_kind: kinds,
+      annotations_dropped: this.annotationsDropped,
+      annotation_warnings: [...this.annotationWarnings],
     };
     const payloads: Record<string, Uint8Array> = {
       [MANIFEST_PATH]: textEncoder.encode(canonicalStringify(manifestObj)),
@@ -1526,7 +1897,15 @@ export class NoOpTraceRecorder {
   recordToolError(_toolCallId: string, _exc: unknown): void {}
   recordRunError(_exc: unknown): void {}
   recordTransitionEvaluation(_stageVisitId: string, _candidates: readonly unknown[]): void {}
-  recordAnnotation(_namespace: string, _kind: string, _payload?: unknown, _anchorSequence?: number): void {}
+  recordAnnotation(
+    _namespace: string,
+    _kind: string,
+    _payload?: unknown,
+    _anchorSequence?: number,
+    _opts?: { stageId?: string; stageVisitId?: string },
+  ): null {
+    return null;
+  }
   observeWorkflowEvent(_event: WorkflowEvent): null {
     return null;
   }
@@ -1805,7 +2184,11 @@ export async function verifyArchive(data: Uint8Array): Promise<VerificationRepor
         if (typeof event.stage_visit_id === "string") visits.add(event.stage_visit_id);
       }
       if (summary.event_count !== eventLines.length) warnings.push("summary event_count mismatch (recomputed)");
-      if (JSON.stringify(summary.counts_by_kind) !== JSON.stringify(kinds)) {
+      // Order-insensitive: the writer serializes counts_by_kind as canonical
+      // JSON (sorted keys) while the recompute below observes first-seen
+      // ledger order. A plain JSON.stringify comparison would warn on every
+      // valid archive, so both sides go through canonical key ordering.
+      if (canonicalStringify(summary.counts_by_kind) !== canonicalStringify(kinds)) {
         warnings.push("summary counts_by_kind mismatch (recomputed)");
       }
       if (summary.stage_visit_count !== visits.size) {
@@ -2082,6 +2465,23 @@ export async function verifyArchive(data: Uint8Array): Promise<VerificationRepor
         const ann = ev.annotation as unknown;
         if (ann === null || typeof ann !== "object" || Array.isArray(ann) || !("namespace" in (ann as Record<string, unknown>) && "kind" in (ann as Record<string, unknown>) && "payload" in (ann as Record<string, unknown>))) {
           errors.push(`public/events.ndjson:${idx + 1} invalid annotation`);
+        } else {
+          const ns = (ann as Record<string, unknown>).namespace;
+          const kd = (ann as Record<string, unknown>).kind;
+          const pl = (ann as Record<string, unknown>).payload;
+          if (typeof ns !== "string" || ns.length < 1 || ns.length > 128) {
+            errors.push(`public/events.ndjson:${idx + 1} invalid annotation namespace`);
+          } else if (typeof kd !== "string" || kd.length < 1 || kd.length > 128) {
+            errors.push(`public/events.ndjson:${idx + 1} invalid annotation kind`);
+          } else if (ns === ANNOTATION_NAMESPACE && kd === ANNOTATION_KIND) {
+            try {
+              validateAutoresearchPayload(pl);
+            } catch (e) {
+              errors.push(`public/events.ndjson:${idx + 1} invalid trial_finished payload: ${String(e)}`);
+            }
+          } else if (pl === null || typeof pl !== "object" || Array.isArray(pl) || !("$redacted" in (pl as Record<string, unknown>))) {
+            errors.push(`public/events.ndjson:${idx + 1} unknown annotation payload must be a redaction marker`);
+          }
         }
       }
       if (hasUnsafeInt(ev)) {

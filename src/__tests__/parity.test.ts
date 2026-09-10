@@ -130,6 +130,13 @@ describe("cross-language parity", () => {
         recorder.recordToolResult(lastTid, op.result as unknown);
       } else if (kind === "record_tool_error") {
         recorder.recordToolError(lastTid, errorWithTypeName(op.error_type as string));
+      } else if (kind === "record_annotation") {
+        recorder.recordAnnotation(
+          op.namespace as string,
+          op.kind as string,
+          op.payload as unknown,
+          op.anchor_sequence as number | undefined,
+        );
       } else if (kind === "observe") {
         const spec = op.event as Record<string, unknown>;
         recorder.observeWorkflowEvent({
