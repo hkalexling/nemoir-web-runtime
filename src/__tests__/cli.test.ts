@@ -23,6 +23,10 @@ const AUDIT_FIXTURE = join(VECTORS, "audit-valid.nemotrace");
 const CVXPYGEN_FIXTURE = join(VECTORS, "cvxpygen-public.nemotrace");
 const REPLAY_FIXTURE = join(CLI_VECTORS, "replay-e2e.nemotrace");
 const VAULT_FIXTURE = join(CLI_VECTORS, "vault-fake-run.nemotrace");
+const PUBLICATION_VECTORS = join(VECTORS, "publication");
+const PUBLICATION_SOURCE = join(PUBLICATION_VECTORS, "source.nemotrace");
+const CONSENT =
+  "I reviewed the disclosure report and certify this trace is safe to publish.";
 const REPLAY_PASSPHRASE = "replay-e2e-passphrase";
 const VAULT_PASSPHRASE = "phase4-vault-fake-passphrase-01";
 
@@ -30,6 +34,7 @@ interface RunResult {
   readonly code: number;
   readonly out: string;
   readonly err: string;
+  readonly written: Map<string, string>;
 }
 
 async function runCli(
@@ -38,15 +43,32 @@ async function runCli(
 ): Promise<RunResult> {
   const out: string[] = [];
   const err: string[] = [];
+  const written = new Map<string, string>();
   const io: Partial<CliIO> = {
     out: (line) => out.push(line),
     err: (line) => err.push(line),
     env,
-    readTextFile: (path) => readFileSync(path, "utf8"),
+    readTextFile: (path) =>
+      written.has(path) ? written.get(path)! : readFileSync(path, "utf8"),
+    writeTextFile: (path, text) => {
+      written.set(path, text);
+      writeFileSync(path, text, "utf8");
+    },
+    readBytes: (path) => new Uint8Array(readFileSync(path)),
+    writeBytes: (path, data) => {
+      written.set(path, new TextDecoder().decode(data));
+      writeFileSync(path, data);
+    },
     promptPassphrase: async () => null,
+    now: () => "2026-09-12T00:00:00.000Z",
   };
   const code = await main(argv, io);
-  return { code, out: out.join("\n") + (out.length > 0 ? "\n" : ""), err: err.join("\n") };
+  return {
+    code,
+    out: out.join("\n") + (out.length > 0 ? "\n" : ""),
+    err: err.join("\n"),
+    written,
+  };
 }
 
 function golden(name: string): string {
@@ -146,5 +168,119 @@ describe("nemotrace-js verify", () => {
     const result = await runCli(["frobnicate"]);
     expect(result.code).toBe(2);
     expect(result.err).toContain("verify");
+  });
+});
+
+describe("nemotrace-js publication", () => {
+  it("scans, attests, and prepares with stable output", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nemotrace-cli-"));
+    try {
+      const report = join(dir, "report.json");
+      const scan = await runCli(["scan-publication", PUBLICATION_SOURCE, "--report", report]);
+      expect(scan.code).toBe(0);
+      expect(scan.out).toContain("scan: passed");
+      expect(scan.out).toContain("report: report.json");
+      expect(scan.err).toBe("");
+      expect(scan.written.get(report)).toBe(
+        readFileSync(join(PUBLICATION_VECTORS, "expected-report.json"), "utf8"),
+      );
+
+      const attestation = join(dir, "attest.json");
+      const attest = await runCli([
+        "attest-publication",
+        "--report",
+        report,
+        "--reviewer",
+        "Alex Ling",
+        "--license",
+        "CC-BY-4.0",
+        "--consent",
+        CONSENT,
+        "--out",
+        attestation,
+      ]);
+      expect(attest.code).toBe(0);
+      expect(attest.out).toContain("attestation: attest.json");
+      expect(attest.written.get(attestation)).toBe(
+        readFileSync(join(PUBLICATION_VECTORS, "expected-attestation.json"), "utf8"),
+      );
+
+      const prepare = await runCli([
+        "prepare-publication",
+        PUBLICATION_SOURCE,
+        join(dir, "published.nemotrace"),
+        "--attest",
+        attestation,
+      ]);
+      expect(prepare.code).toBe(0);
+      expect(prepare.out).toContain("attested: true");
+      expect(prepare.out).toContain(
+        "content_identity: sha256:d24eecd24368396dc800360d5a8081a367cebdbfc31d6e5a2ac651ee108d49e1",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a replay source with exit 1", async () => {
+    const result = await runCli(["scan-publication", REPLAY_FIXTURE]);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("requires an 'audit' source");
+  });
+
+  it("exits 2 for missing inputs and unknown options", async () => {
+    const missing = await runCli(["scan-publication", "/tmp/does-not-exist.nemotrace"]);
+    expect(missing.code).toBe(2);
+    expect(missing.err).toContain("not found");
+    const unknown = await runCli(["scan-publication", PUBLICATION_SOURCE, "--bogus"]);
+    expect(unknown.code).toBe(2);
+    expect(unknown.err).toContain("unknown option");
+  });
+
+  it("refuses a stale attestation with exit 1", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nemotrace-cli-"));
+    try {
+      const stale = join(dir, "stale.json");
+      writeFileSync(
+        stale,
+        readFileSync(join(PUBLICATION_VECTORS, "expected-attestation.json"), "utf8"),
+        "utf8",
+      );
+      const result = await runCli([
+        "prepare-publication",
+        AUDIT_FIXTURE,
+        join(dir, "out.nemotrace"),
+        "--attest",
+        stale,
+      ]);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("does not cover this projection");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a hand-written attestation that does not cover the projection", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nemotrace-cli-"));
+    try {
+      const attestation = JSON.parse(
+        readFileSync(join(PUBLICATION_VECTORS, "expected-attestation.json"), "utf8"),
+      ) as Record<string, unknown>;
+      (attestation["projection"] as Record<string, unknown>)["sha256"] =
+        `sha256:${"11".repeat(32)}`;
+      const forged = join(dir, "forged.json");
+      writeFileSync(forged, JSON.stringify(attestation), "utf8");
+      const result = await runCli([
+        "prepare-publication",
+        PUBLICATION_SOURCE,
+        join(dir, "out.nemotrace"),
+        "--attest",
+        forged,
+      ]);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain("does not cover this projection");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

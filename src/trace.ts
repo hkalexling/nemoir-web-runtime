@@ -65,7 +65,10 @@ export const VAULT_NULL_IR_SHA256 = "sha256:" + "00".repeat(32);
 export const DEFAULT_MAX_VAULT_BYTES = 64 * 1024 * 1024;
 
 // Deterministic ZIP profile (matches the Phase 0 fixture assembly).
-const ZIP_EPOCH = /* @__PURE__ */ new Date("1980-01-01T00:00:00Z");
+// Local-component construction so the DOS timestamp is always
+// 1980-01-01 00:00:00 and never timezone-dependent; this also matches the
+// Python writer's literal (1980, 1, 1, 0, 0, 0) tuple byte for byte.
+const ZIP_EPOCH = /* @__PURE__ */ new Date(1980, 0, 1, 0, 0, 0);
 const ZIP_DEFLATE_LEVEL = 6;
 
 // Reader limits: local audit/replay viewer budget from schema/README.md §2.
@@ -278,7 +281,7 @@ function resultTypeSlug(value: unknown): string {
 // Secret registry + cleartext scanner (secrets-v1)
 // ---------------------------------------------------------------------------
 
-class SecretRegistry {
+export class SecretRegistry {
   private readonly long: ReadonlySet<string>;
   private readonly short: ReadonlySet<string>;
   private readonly shortPatterns: readonly RegExp[];
@@ -2580,46 +2583,7 @@ export class TraceRecorder {
   }
 
   private finalScan(entries: Record<string, Uint8Array>): void {
-    const problems: string[] = [];
-    for (const [path, data] of Object.entries(entries)) {
-      if (path === VAULT_ENC_PATH) continue;
-      if (path.endsWith(".ndjson")) {
-        const lines = textDecoder.decode(data).split("\n");
-        lines.forEach((line, index) => {
-          if (line.trim() === "") return;
-          let value: unknown;
-          try {
-            value = parseJsonStrict(line);
-          } catch (error) {
-            problems.push(`${path}:${index + 1}: unparsable (${String(error)})`);
-            return;
-          }
-          for (const finding of scanStrings(value, "", this.registry)) {
-            problems.push(`${path}:${index + 1}:${finding.pointer} [${finding.rule}]`);
-          }
-          if (hasUnsafeInt(value)) {
-            problems.push(`${path}:${index + 1} [unsafe_integer]`);
-          }
-        });
-      } else {
-        let value: unknown;
-        try {
-          value = parseJsonStrict(textDecoder.decode(data));
-        } catch (error) {
-          problems.push(`${path}: unparsable (${String(error)})`);
-          continue;
-        }
-        for (const finding of scanStrings(value, "", this.registry)) {
-          problems.push(`${path}:${finding.pointer} [${finding.rule}]`);
-        }
-        if (hasUnsafeInt(value)) {
-          problems.push(`${path} [unsafe_integer]`);
-        }
-      }
-      if (scanStrings({ name: path }, "/name", this.registry).length > 0) {
-        problems.push(`${path}: filename finding`);
-      }
-    }
+    const problems = scanCleartextEntries(entries, this.registry);
     if (problems.length > 0) {
       const detail = problems.slice(0, 10).join("; ");
       throw new TraceError(
@@ -2627,6 +2591,63 @@ export class TraceRecorder {
       );
     }
   }
+}
+
+/**
+ * Scan cleartext entries for `secrets-v1` findings and unsafe integers.
+ *
+ * Returns location-only problem strings (`entry:pointer [rule]`) and never the
+ * matched value. Ciphertext (`private/vault.enc`) is skipped: it is
+ * pseudorandom and its plaintext was scanned before encryption. Entry names are
+ * scanned too. An omitted registry is the correct posture for a transform that
+ * has no capture-time secret values (publication relies on capture-time
+ * redaction plus these detector rules).
+ */
+export function scanCleartextEntries(
+  entries: Record<string, Uint8Array>,
+  registry: SecretRegistry = new SecretRegistry(),
+): string[] {
+  const problems: string[] = [];
+  for (const [path, data] of Object.entries(entries)) {
+    if (path === VAULT_ENC_PATH) continue;
+    if (path.endsWith(".ndjson")) {
+      const lines = textDecoder.decode(data).split("\n");
+      lines.forEach((line, index) => {
+        if (line.trim() === "") return;
+        let value: unknown;
+        try {
+          value = parseJsonStrict(line);
+        } catch (error) {
+          problems.push(`${path}:${index + 1}: unparsable (${String(error)})`);
+          return;
+        }
+        for (const finding of scanStrings(value, "", registry)) {
+          problems.push(`${path}:${index + 1}:${finding.pointer} [${finding.rule}]`);
+        }
+        if (hasUnsafeInt(value)) {
+          problems.push(`${path}:${index + 1} [unsafe_integer]`);
+        }
+      });
+    } else {
+      let value: unknown;
+      try {
+        value = parseJsonStrict(textDecoder.decode(data));
+      } catch (error) {
+        problems.push(`${path}: unparsable (${String(error)})`);
+        continue;
+      }
+      for (const finding of scanStrings(value, "", registry)) {
+        problems.push(`${path}:${finding.pointer} [${finding.rule}]`);
+      }
+      if (hasUnsafeInt(value)) {
+        problems.push(`${path} [unsafe_integer]`);
+      }
+    }
+    if (scanStrings({ name: path }, "/name", registry).length > 0) {
+      problems.push(`${path}: filename finding`);
+    }
+  }
+  return problems;
 }
 
 export class NoOpTraceRecorder {

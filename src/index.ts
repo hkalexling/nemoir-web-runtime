@@ -107,6 +107,7 @@ export {
   resolveTraceRecorder,
   writeArchive,
   readArchiveEntries,
+  scanCleartextEntries,
   verifyArchive,
   unlockArchive,
   encryptVaultRecords,
@@ -131,6 +132,30 @@ export {
   manifestFromDict,
   type ReplayReport,
 } from "./replay.js";
+// Publication transform (Phase 5): audit -> attested, vault-free publication.
+export {
+  PUBLICATION_ATTESTATION_FORMAT,
+  PUBLICATION_PROJECTION_FORMAT,
+  PUBLICATION_REDACTION_POLICY,
+  PUBLICATION_REPORT_FORMAT,
+  PublicationError,
+  attestationDocument,
+  attestationFromDict,
+  attestationFromReport,
+  buildAttestation,
+  preparePublication,
+  publicationReport,
+  publicationReportPath,
+  scanPublication,
+  serializeDocument,
+  type PublicationAttestation,
+  type PublicationOptions,
+  type PublicationOptionsDict,
+  type PublicationProjection,
+  type PublicationResult,
+  type PublicationSource,
+  type PublicationStats,
+} from "./publication.js";
 
 // Runtime types
 export {
