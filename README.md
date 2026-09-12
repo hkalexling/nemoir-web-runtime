@@ -165,6 +165,10 @@ portable execution record per run, optionally with an encrypted replay vault
 and reports its levels — integrity, structural, semantic, and replayability —
 reusing the same library reports as the browser viewer:
 
+The artifact format, capture profiles, verification and replay levels, and
+publication gates are documented in the public compiler docs:
+[Trace artifacts](https://github.com/hkalexling/nemoir/blob/master/docs/trace.md).
+
 ```bash
 npx nemotrace-js verify run.nemotrace                          # public levels
 npx nemotrace-js verify run.nemotrace --unlock env:VAULT_PW    # + semantic evidence
