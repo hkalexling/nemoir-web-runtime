@@ -19,6 +19,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "nemotrace-js": "./bin/nemotrace-js.mjs"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
@@ -62,6 +65,7 @@
   "files": [
     "dist",
     "src",
+    "bin",
     "README.md"
   ]
 }

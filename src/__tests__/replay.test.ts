@@ -178,4 +178,34 @@ describe("replay", () => {
     const tools = new TapedToolRegistry([]);
     await expect(tools.call("fs.read", {}, { workflowId: "w", stageId: "A", inputs: {}, metadata: {} } as ToolContext)).rejects.toThrow(TapedReplayError);
   });
+
+  it("taped stubs skip catalog validation for incomplete schemas", async () => {
+    // Regression: `_validateTools` was a dead static no-op, so a stub whose
+    // schema lacked catalog-required params (incomplete early vault) threw
+    // ToolValidationError instead of replaying.
+    const fixtures = [
+      {
+        record_type: "tool_result",
+        capability: "fs.read",
+        tool_name: "read_file",
+        payload: { args: { path: "x" }, result: { ok: true } },
+      },
+    ];
+    const tools = new TapedToolRegistry(fixtures, new Map([["fs.read", { inputs: {}, outputs: {} }]]));
+    const out = await tools.call(
+      "fs.read",
+      { path: "x" },
+      { workflowId: "w", stageId: "A", inputs: {}, metadata: {} } as ToolContext,
+    );
+    expect(out).toEqual({ ok: true });
+  });
+
+  it("live registries still validate against the capability catalog", () => {
+    expect(
+      () =>
+        new ToolRegistry([
+          { name: "bad", capability: "fs.read", description: "", inputSchema: {}, handler: async () => ({}) },
+        ]),
+    ).toThrow(/missing required parameter/);
+  });
 });

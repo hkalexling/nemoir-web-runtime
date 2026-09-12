@@ -157,6 +157,32 @@ for await (const event of agent.stream(inputs)) {
 The generated `agent.ts` imports from `@nemoir/web-runtime` and wires the
 runtime against the compiled `workflow.json`.
 
+## Trace verification (`nemotrace-js`)
+
+The runtime records **NemoTrace** archives (`*.nemotrace`): one redacted,
+portable execution record per run, optionally with an encrypted replay vault
+(WebCrypto PBKDF2/AES-GCM). The bundled `nemotrace-js` CLI verifies an archive
+and reports its levels — integrity, structural, semantic, and replayability —
+reusing the same library reports as the browser viewer:
+
+```bash
+npx nemotrace-js verify run.nemotrace                          # public levels
+npx nemotrace-js verify run.nemotrace --unlock env:VAULT_PW    # + semantic evidence
+npx nemotrace-js verify run.nemotrace --replay file:./pw.txt   # + taped replay
+```
+
+`--unlock` and `--replay` are mutually exclusive and take a passphrase source:
+`env:VAR`, `file:PATH`, or `prompt` (interactive TTY; piped stdin is read
+without echo). Output is a stable `key: value` report on stdout; the exit code
+is `0` when the requested level passed, `1` when it failed, and `2` for usage
+errors. Output is byte-identical to the Python `nemotrace` CLI for the shared
+fixtures under `docs/trace/schema/test-vectors/cli/`. Passphrase values, vault
+plaintext, and stack traces are never printed.
+
+Taped replay re-executes the recorded state machine with recorded model/tool
+fixtures only — no provider calls, no real tool effects. It is deterministic
+playback of captured evidence, not a live rerun.
+
 ## Development
 
 ```bash

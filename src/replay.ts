@@ -419,9 +419,9 @@ export class TapedToolRegistry extends ToolRegistry {
     return super.getByName(name);
   }
 
-  // Disable catalog validation for taped stubs - they are synthetic fixtures.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  static _validateTools(_tools: Tool[]): void { /* no-op */ }
+  // Taped stubs are per-recorded-capability synthetic tools, not catalog
+  // tools; skip catalog validation (mirrors Python `_validate_tools`).
+  protected override _validateTools(_tools: readonly Tool[]): void { /* no-op */ }
 
   override async call(capability: string, args: Record<string, unknown>, ctx: ToolContext, toolName?: string): Promise<unknown> {
     if (this.fixtures.length === 0) throw new TapedReplayError(`taped replay has no tool fixture for capability '${capability}' at stage '${ctx.stageId}'`);
