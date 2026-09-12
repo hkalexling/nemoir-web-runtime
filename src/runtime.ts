@@ -593,6 +593,26 @@ export class WorkflowRuntime {
     for (const policy of policies) {
       if (policy.kind === "deny" && policy.condition) {
         const boundArgs = bindTriggerArgs(policy.trigger, args, policy.id, capability);
+        const tapedOutcome = (rec as unknown as { consumeTapedPolicy?: (id: unknown) => string | null }).consumeTapedPolicy?.(policy.id) ?? null;
+        if (tapedOutcome !== null) {
+          const denied = tapedOutcome === "denied";
+          await emitter.emit("policy_checked", {
+            stageId: stage.id,
+            capability,
+            metadata: { policyId: policy.id, policyKind: "deny", denied },
+          });
+          (rec as unknown as { recordPolicyEvaluation?: (...a: unknown[]) => void }).recordPolicyEvaluation?.(null, policy.id, boundArgs, denied ? "denied" : "allowed");
+          if (denied) {
+            await emitter.emit("policy_denied", {
+              stageId: stage.id,
+              capability,
+              error: `Policy '${policy.id}' denied capability '${capability}'`,
+              metadata: { policyId: policy.id },
+            });
+            throw new PolicyDeniedError(`Policy '${policy.id}' denied capability '${capability}'`);
+          }
+          continue;
+        }
         const ctx: PolicyRefContext = { inputs, boundArgs, policyId: policy.id, capability };
         const resolve = (ref: Parameters<typeof resolvePolicyRef>[0]) => resolvePolicyRef(ref, ctx);
         const recurse = (e: Parameters<typeof evalExpr>[0]) => evalExpr(e, resolve, recurse);
@@ -606,6 +626,7 @@ export class WorkflowRuntime {
               capability,
               metadata: { policyId: policy.id, policyKind: "deny", denied: true, error: String(e) },
             });
+            (rec as unknown as { recordPolicyEvaluation?: (...a: unknown[]) => void }).recordPolicyEvaluation?.(null, policy.id, boundArgs, "denied");
             throw new PolicyEvaluationError(
               `Policy '${policy.id}': condition evaluation failed for capability '${capability}': ${e}`,
             );
@@ -617,6 +638,7 @@ export class WorkflowRuntime {
           capability,
           metadata: { policyId: policy.id, policyKind: "deny", denied },
         });
+        (rec as unknown as { recordPolicyEvaluation?: (...a: unknown[]) => void }).recordPolicyEvaluation?.(null, policy.id, boundArgs, denied ? "denied" : "allowed");
         if (denied) {
           await emitter.emit("policy_denied", {
             stageId: stage.id,
@@ -675,11 +697,13 @@ export class WorkflowRuntime {
               error: `user.confirm returned False for policy '${policy.id}'`,
               metadata: { policyId: policy.id },
             });
+            (rec as unknown as { recordPolicyEvaluation?: (...a: unknown[]) => void }).recordPolicyEvaluation?.(null, policy.id, boundArgs, "denied");
             throw new PolicyDeniedError(
               `Policy '${policy.id}': user.confirm returned False, blocking capability '${capability}'`,
             );
           }
         }
+        (rec as unknown as { recordPolicyEvaluation?: (...a: unknown[]) => void }).recordPolicyEvaluation?.(null, policy.id, boundArgs, "allowed");
       }
     }
 
@@ -710,7 +734,7 @@ export class WorkflowRuntime {
 
     try {
       const result = await this.tools.call(capability, args, ctx, toolName);
-      rec.recordToolResult(toolCallId, result);
+      (rec as unknown as { recordToolResult?: (...a: unknown[]) => void }).recordToolResult?.(toolCallId, result, args);
       await emitter.emit("tool_call_completed", {
         stageId: stage.id,
         capability,
@@ -750,6 +774,7 @@ export class WorkflowRuntime {
     const runId = generateRunId();
     const rec = resolveRecorder(opts?.traceRecorder);
     rec.beginRun(this.manifest);
+    (rec as unknown as { recordRunInputs?: (i: unknown) => void }).recordRunInputs?.(inputs);
     // Trace observer does not count as a live sink, so provider streaming
     // stays gated on a real caller consumer.
     const userSink = opts?.eventSink ?? null;

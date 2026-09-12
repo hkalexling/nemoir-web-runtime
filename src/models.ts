@@ -59,6 +59,15 @@ import {
   responseBytes,
 } from "./trace.js";
 
+function vaultResponsePayload(response: ModelResponse): Record<string, unknown> {
+  return {
+    content: response.content,
+    tool_calls: (response.toolCalls ?? []).map((c) => ({ id: c.id, name: c.name, arguments: { ...(c.arguments ?? {}) } })),
+    reasoning: (response as unknown as Record<string, unknown>)["reasoning"] ?? response.reasoning ?? null,
+    ...((response as unknown as Record<string, unknown>)["usage"] ? { usage: (response as unknown as Record<string, unknown>)["usage"] } : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Action protocol types
 // ---------------------------------------------------------------------------
@@ -795,14 +804,21 @@ export class ModelStageExecutor implements StageExecutor {
       let response: ModelResponse;
       // Each attempt gets its own trace model-call id.
       const modelCallId = rec.beginModelCall(ctx.stage.id);
+      (rec as unknown as { recordModelRequest?: (...a: unknown[]) => void; vault_enabled?: boolean }).recordModelRequest?.(modelCallId, {
+        messages: [...request.messages] as unknown as Record<string, unknown>[],
+        tools: [...request.tools] as unknown as Record<string, unknown>[],
+        output_schema: request.outputSchema as Record<string, unknown>,
+        options: request.options as Record<string, unknown>,
+      } as unknown as Record<string, unknown>);
       try {
         if (useStreaming && emitter) {
           response = await this.streamAdapterResponse(adapter, request, ctx, emitter, rec, modelCallId);
         } else {
           response = await adapter.complete(request);
-          rec.recordModelResponse(modelCallId, {
+          (rec as unknown as { recordModelResponse: (...a: unknown[]) => void }).recordModelResponse(modelCallId, {
             responseBytes: responseBytes(response),
             toolCallCount: response.toolCalls?.length ?? 0,
+            response: vaultResponsePayload(response),
           });
           if (emitter) {
             await emitter.emit("model_completed", { stageId: ctx.stage.id });
@@ -1136,9 +1152,10 @@ export class ModelStageExecutor implements StageExecutor {
       // Fall back to complete() if streaming not available
       const resp = await adapter.complete(request);
       if (modelCallId) {
-        rec.recordModelResponse(modelCallId, {
+        (rec as unknown as { recordModelResponse: (...a: unknown[]) => void }).recordModelResponse(modelCallId, {
           responseBytes: responseBytes(resp),
           toolCallCount: resp.toolCalls?.length ?? 0,
+          response: vaultResponsePayload(resp),
         });
       }
       await emitter.emit("model_completed", { stageId: ctx.stage.id });
@@ -1155,9 +1172,10 @@ export class ModelStageExecutor implements StageExecutor {
       } else if (chunk.kind === "completed") {
         finalResponse = chunk.response ?? null;
         if (finalResponse && modelCallId) {
-          rec.recordModelResponse(modelCallId, {
+          (rec as unknown as { recordModelResponse: (...a: unknown[]) => void }).recordModelResponse(modelCallId, {
             responseBytes: responseBytes(finalResponse),
             toolCallCount: finalResponse.toolCalls?.length ?? 0,
+            response: vaultResponsePayload(finalResponse),
           });
         }
         await emitter.emit("model_completed", { stageId: ctx.stage.id });

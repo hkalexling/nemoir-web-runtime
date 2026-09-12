@@ -46,7 +46,23 @@ export const GRAPH_PATH = "public/workflow.graph.json";
 export const EVENTS_PATH = "public/events.ndjson";
 export const SUMMARY_PATH = "public/summary.json";
 export const INTEGRITY_PATH = "integrity.json";
+export const VAULT_ENC_PATH = "private/vault.enc";
+export const VAULT_META_PATH = "private/vault.meta.json";
 export const AUDIT_ENTRY_PATHS = [MANIFEST_PATH, GRAPH_PATH, EVENTS_PATH, SUMMARY_PATH] as const;
+export const VAULT_ENTRY_PATHS = [VAULT_ENC_PATH, VAULT_META_PATH] as const;
+
+export const VAULT_CODEC = "PBKDF2-HMAC-SHA-256+A256GCM";
+export const VAULT_META_FORMAT = "nemoir.trace.vault-meta/0.1";
+export const VAULT_AAD_FORMAT = "nemoir.trace.vault-aad/0.1";
+export const VAULT_KDF_NAME = "PBKDF2-HMAC-SHA-256";
+export const VAULT_KDF_ITERATIONS = 600_000;
+export const VAULT_SALT_BYTES = 16;
+export const VAULT_NONCE_BYTES = 12;
+export const VAULT_DERIVED_KEY_BITS = 256;
+export const VAULT_TAG_BITS = 128;
+export const VAULT_PLAINTEXT_MEDIA_TYPE = "application/x-ndjson";
+export const VAULT_NULL_IR_SHA256 = "sha256:" + "00".repeat(32);
+export const DEFAULT_MAX_VAULT_BYTES = 64 * 1024 * 1024;
 
 // Deterministic ZIP profile (matches the Phase 0 fixture assembly).
 const ZIP_EPOCH = /* @__PURE__ */ new Date("1980-01-01T00:00:00Z");
@@ -122,6 +138,16 @@ export interface StageAnnotationSpec {
   readonly anchorSequence?: number;
 }
 
+export interface VaultCapture {
+  readonly includeModelMessages?: boolean;
+  readonly includeToolResults?: boolean;
+  readonly includeStageSnapshots?: boolean;
+  readonly includeTransitionPolicy?: boolean;
+  readonly includeReasoning?: boolean;
+  readonly includeIr?: boolean;
+  readonly maxVaultBytes?: number;
+}
+
 export interface TraceConfig {
   readonly profile?: string;
   readonly provenance?: HostProvenance;
@@ -144,6 +170,8 @@ export interface TraceConfig {
    * and may return one annotation spec or null. Failures never break a run.
    */
   readonly onStageCompleted?: (info: StageCompletedInfo) => StageAnnotationSpec | null | undefined;
+  readonly vaultPassphrase?: string | Uint8Array | null;
+  readonly vaultCapture?: VaultCapture;
 }
 
 export interface VerificationReport {
@@ -151,6 +179,26 @@ export interface VerificationReport {
   readonly contentIdentity: string | null;
   readonly warnings: readonly string[];
   readonly errors: readonly string[];
+  readonly integrity: string;
+  readonly structural: string;
+  readonly semantic: string;
+  readonly replayability: string;
+}
+
+export function policyRefsFor(policies: readonly { id: string }[] | null | undefined): Map<string, string> {
+  const refs = new Map<string, string>();
+  let index = 1;
+  for (const policy of policies ?? []) {
+    const maybe = policy as unknown as { id?: unknown } | Record<string, unknown>;
+    const pid = typeof (maybe as Record<string, unknown>)["id"] === "string"
+      ? (maybe as Record<string, unknown>)["id"] as string
+      : (maybe as { id?: unknown }).id;
+    if (typeof pid === "string" && !refs.has(pid)) {
+      refs.set(pid, `p-${index}`);
+    }
+    index += 1;
+  }
+  return refs;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +394,12 @@ function scanStrings(node: unknown, pointer: string, registry: SecretRegistry): 
   const findings: Finding[] = [];
   for (const [childPointer, key, value] of iterStrings(node, pointer)) {
     if (key !== null && PROHIBITED_KEYS.has(key)) {
+      // An already-markered value is neutralized: the key name alone
+      // (declared in the workflow's public writes schema) is not a leak.
+      // Reporting it would loop the mask passes until the whole record is
+      // omitted — dropping milestone events taped replay needs for path
+      // comparison. Raw values stay reportable below.
+      if (isRedactionMarker(nodeAtPointer(node, childPointer))) continue;
       findings.push({ rule: "prohibited_field", pointer: childPointer });
       continue;
     }
@@ -405,6 +459,223 @@ function hasUnsafeInt(node: unknown): boolean {
     return Object.values(node as Record<string, unknown>).some(hasUnsafeInt);
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Vault helpers (Phase 4)
+// ---------------------------------------------------------------------------
+
+export const _VAULT_CREDENTIAL_KEYS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "api_key",
+  "api-key",
+  "apikey",
+  "access_token",
+  "refresh_token",
+  "client_secret",
+  "extra_headers",
+  "default_headers",
+  "headers",
+]);
+
+const _VAULT_RECORD_TYPES = new Set([
+  "run_inputs",
+  "stage_snapshot",
+  "model_request",
+  "model_response",
+  "tool_result",
+  "transition_evaluation",
+  "policy_evaluation",
+  "private_fields",
+  "full_workflow_ir",
+  "annotation_private_fields",
+]);
+
+export function normalizePassphrase(value: string | Uint8Array | null | undefined): Uint8Array | null {
+  if (value === null || value === undefined) return null;
+  let text: string;
+  if (value instanceof Uint8Array) {
+    try {
+      text = textDecoder.decode(value);
+    } catch {
+      throw new TraceError("vault passphrase must be valid UTF-8");
+    }
+  } else {
+    text = value;
+  }
+  if (text.length === 0) return null;
+  const normalized = text.normalize("NFC");
+  return textEncoder.encode(normalized);
+}
+
+function b64urlEncode(raw: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < raw.length; i++) binary += String.fromCharCode(raw[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function b64urlDecode(value: string, what: string, expected?: number): Uint8Array {
+  const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  let binary: string;
+  try {
+    binary = atob(base64);
+  } catch {
+    throw new TraceError(`vault metadata has invalid base64url for ${what}`);
+  }
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  if (expected !== undefined && out.length !== expected) {
+    throw new TraceError(`vault metadata has invalid length for ${what}`);
+  }
+  return out;
+}
+
+export function _toJsonable(value: unknown, depth = 0): unknown {
+  if (depth > 64) throw new TraceError("vault value exceeds nesting depth");
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TraceError("vault value has non-finite number");
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) throw new TraceError(`vault value has unsafe integer ${JSON.stringify(value)}`);
+    return value;
+  }
+  if (value instanceof Uint8Array) return textDecoder.decode(value);
+  if (value instanceof ArrayBuffer) return textDecoder.decode(new Uint8Array(value));
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Map) {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of value.entries()) {
+      obj[String(k)] = _toJsonable(v, depth + 1);
+    }
+    return obj;
+  }
+  if (value instanceof Set) {
+    const arr = [...value].map((v) => _toJsonable(v, depth + 1));
+    return arr.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  }
+  if (Array.isArray(value)) return (value as unknown[]).map((v) => _toJsonable(v, depth + 1));
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    // Detect plain object vs class - still convert keys
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(record)) {
+      out[k] = _toJsonable(v, depth + 1);
+    }
+    return out;
+  }
+  throw new TraceError(`vault value of type ${typeof value} is not serializable`);
+}
+
+function nodeAtPointer(node: unknown, pointer: string): unknown {
+  if (pointer === "" || pointer === "/") return node;
+  let current: unknown = node;
+  for (const part of pointer.split("/").slice(1)) {
+    const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (current !== null && typeof current === "object" && !Array.isArray(current)) {
+      const map = current as Record<string, unknown>;
+      if (!(key in map)) return null;
+      current = map[key];
+    } else if (Array.isArray(current)) {
+      if (!/^\d+$/.test(key) || Number(key) >= (current as unknown[]).length) return null;
+      current = (current as unknown[])[Number(key)];
+    } else {
+      return null;
+    }
+  }
+  return current;
+}
+
+function isRedactionMarker(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return "$redacted" in (value as Record<string, unknown>) && typeof (value as Record<string, unknown>)["$redacted"] === "object";
+}
+
+function vaultFindingExcused(record: Record<string, unknown>, finding: Finding): boolean {
+  if (isRedactionMarker(nodeAtPointer(record, finding.pointer))) return true;
+  if (finding.rule === "prohibited_field") {
+    const key = finding.pointer.split("/").pop()!.replace(/~1/g, "/").replace(/~0/g, "~");
+    return !_VAULT_CREDENTIAL_KEYS.has(key.toLowerCase());
+  }
+  return false;
+}
+
+function vaultRecordShapeError(record: unknown): string | null {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return "vault record must be an object";
+  const entry = record as Record<string, unknown>;
+  if (typeof entry.record_id !== "string" || !/^v-[1-9][0-9]*$/.test(entry.record_id)) return `vault record has invalid record_id ${JSON.stringify(entry.record_id)}`;
+  if (!_VAULT_RECORD_TYPES.has(entry.record_type as string)) return `vault record has invalid record_type ${JSON.stringify(entry.record_type)}`;
+  return null;
+}
+
+function vaultMetaObject(params: { salt: Uint8Array; nonce: Uint8Array; aadDict: Record<string, unknown> }): Record<string, unknown> {
+  return {
+    format: VAULT_META_FORMAT,
+    codec: VAULT_CODEC,
+    passphrase: { encoding: "UTF-8", normalization: "NFC" },
+    kdf: {
+      name: VAULT_KDF_NAME,
+      iterations: VAULT_KDF_ITERATIONS,
+      salt_base64url: b64urlEncode(params.salt),
+      derived_key_bits: VAULT_DERIVED_KEY_BITS,
+    },
+    cipher: {
+      name: "AES-256-GCM",
+      nonce_base64url: b64urlEncode(params.nonce),
+      tag_length_bits: VAULT_TAG_BITS,
+      tag_placement: "ciphertext_suffix",
+    },
+    plaintext: {
+      media_type: VAULT_PLAINTEXT_MEDIA_TYPE,
+      encoding: "UTF-8",
+      compression: "none",
+    },
+    aad: params.aadDict,
+  };
+}
+
+async function deriveVaultKey(passphrase: Uint8Array, salt: Uint8Array): Promise<CryptoKey> {
+  const baseKey = await crypto.subtle.importKey("raw", passphrase as unknown as ArrayBuffer, { name: "PBKDF2" }, false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", hash: "SHA-256", salt: salt as unknown as ArrayBuffer, iterations: VAULT_KDF_ITERATIONS },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+export async function encryptVaultRecords(
+  plaintext: Uint8Array,
+  passphrase: Uint8Array,
+  aad: Uint8Array,
+  opts: { salt?: Uint8Array; nonce?: Uint8Array } = {},
+): Promise<{ salt: Uint8Array; nonce: Uint8Array; sealed: Uint8Array }> {
+  const salt = opts.salt ?? crypto.getRandomValues(new Uint8Array(VAULT_SALT_BYTES));
+  const nonce = opts.nonce ?? crypto.getRandomValues(new Uint8Array(VAULT_NONCE_BYTES));
+  if (salt.length !== VAULT_SALT_BYTES || nonce.length !== VAULT_NONCE_BYTES) throw new TraceError("vault salt/nonce have invalid length");
+  const key = await deriveVaultKey(passphrase, salt);
+  const sealedBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce as unknown as ArrayBuffer, additionalData: aad as unknown as ArrayBuffer, tagLength: 128 }, key, plaintext as unknown as ArrayBuffer);
+  return { salt, nonce, sealed: new Uint8Array(sealedBuf) };
+}
+
+export async function decryptVaultRecords(
+  sealed: Uint8Array,
+  passphrase: Uint8Array,
+  aad: Uint8Array,
+  params: { salt: Uint8Array; nonce: Uint8Array },
+): Promise<Uint8Array> {
+  if (params.salt.length !== VAULT_SALT_BYTES || params.nonce.length !== VAULT_NONCE_BYTES) throw new TraceError("vault unlock failed");
+  if (sealed.length < 16) throw new TraceError("vault unlock failed");
+  const key = await deriveVaultKey(passphrase, params.salt);
+  try {
+    const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: params.nonce as unknown as ArrayBuffer, additionalData: aad as unknown as ArrayBuffer, tagLength: 128 }, key, sealed as unknown as ArrayBuffer);
+    return new Uint8Array(plainBuf);
+  } catch {
+    throw new TraceError("vault unlock failed");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,15 +959,50 @@ interface RecorderConfig {
   readonly traceId: string;
   readonly clock: () => Date;
   readonly onStageCompleted?: (info: StageCompletedInfo) => StageAnnotationSpec | null | undefined;
+  readonly vaultPassphrase: Uint8Array | null;
+  readonly vaultCapture: Required<VaultCapture>;
+}
+
+function defaultVaultCapture(): Required<VaultCapture> {
+  return {
+    includeModelMessages: true,
+    includeToolResults: true,
+    includeStageSnapshots: true,
+    includeTransitionPolicy: true,
+    includeReasoning: false,
+    includeIr: true,
+    maxVaultBytes: DEFAULT_MAX_VAULT_BYTES,
+  };
+}
+
+function normalizeVaultCapture(input?: VaultCapture): Required<VaultCapture> {
+  const def = defaultVaultCapture();
+  if (!input) return def;
+  return {
+    includeModelMessages: input.includeModelMessages ?? def.includeModelMessages,
+    includeToolResults: input.includeToolResults ?? def.includeToolResults,
+    includeStageSnapshots: input.includeStageSnapshots ?? def.includeStageSnapshots,
+    includeTransitionPolicy: input.includeTransitionPolicy ?? def.includeTransitionPolicy,
+    includeReasoning: input.includeReasoning ?? def.includeReasoning,
+    includeIr: input.includeIr ?? def.includeIr,
+    maxVaultBytes: input.maxVaultBytes ?? def.maxVaultBytes,
+  };
 }
 
 function normalizeConfig(config: TraceConfig = {}): RecorderConfig {
   const profile = config.profile ?? "audit";
-  if (profile !== "audit") {
+  if (profile !== "audit" && profile !== "replay") {
     throw new TraceError(
-      `unsupported trace profile '${profile}': Phase 1 supports only 'audit' ` +
-        `(replay arrives in Phase 4, publication in Phase 5)`,
+      `unsupported trace profile '${profile}': expected 'audit' or 'replay' (publication arrives in Phase 5)`,
     );
+  }
+  const vaultPassphrase = normalizePassphrase(config.vaultPassphrase ?? null);
+  const vaultCapture = normalizeVaultCapture(config.vaultCapture);
+  if (profile === "replay" && vaultPassphrase === null) {
+    throw new TraceError("trace profile 'replay' requires vaultPassphrase");
+  }
+  if (profile !== "replay" && vaultPassphrase !== null) {
+    throw new TraceError("vaultPassphrase requires trace profile 'replay'");
   }
   let traceId = config.traceId ?? generateTraceId();
   if (!/^[0-9a-f]{32}$/.test(traceId)) {
@@ -720,6 +1026,8 @@ function normalizeConfig(config: TraceConfig = {}): RecorderConfig {
     traceId,
     clock: config.clock ?? (() => new Date()),
     onStageCompleted: config.onStageCompleted,
+    vaultPassphrase,
+    vaultCapture,
   };
 }
 
@@ -734,6 +1042,10 @@ export class TraceRecorder {
   private readonly events: Record<string, unknown>[] = [];
   private readonly pendingVisits = new Map<string, string[]>();
   private readonly pendingModels = new Map<string, string[]>();
+  // Last model-call id bound to a ledger record in each visit. A retry
+  // emitted after model_completed consumed the pending id reuses this
+  // instead of synthesizing a dangling id with no vault evidence.
+  private readonly lastModelId = new Map<string, string>();
   private readonly pendingTools = new Map<string, string[]>();
   private readonly openTools = new Map<string, string[]>();
   private currentVisit: string | null = null;
@@ -743,6 +1055,7 @@ export class TraceRecorder {
   private annotationsDropped = 0;
   private readonly annotationWarnings: string[] = [];
   private readonly modelBytes = new Map<string, number>();
+  private readonly modelToolCalls = new Map<string, number>();
   private readonly toolStartedAt = new Map<string, Date>();
   private readonly toolResultTypes = new Map<string, string>();
   private readonly toolErrors = new Map<string, { code: string; typeName: string }>();
@@ -755,10 +1068,36 @@ export class TraceRecorder {
   private readonly pathRefs = new Map<string, string>();
   private stageCompletedCount = 0;
   private eventLimitExceeded = false;
+  // Vault state
+  private readonly openToolCalls = new Map<string, Record<string, unknown>>();
+  private readonly vaultRecords: Record<string, unknown>[] = [];
+  private vaultCount = 0;
+  private readonly pendingTransitions = new Map<string, { candidates: Record<string, unknown>[] }[]>();
 
   constructor(config: TraceConfig = {}) {
     this.config = normalizeConfig(config);
     this.registry = new SecretRegistry(this.config.secrets);
+  }
+
+  get vault_enabled(): boolean {
+    return this.config.profile === "replay";
+  }
+
+  get vaultEnabled(): boolean {
+    return this.vault_enabled;
+  }
+
+  /** Optional taped policy outcomes for replay (see replay.ts). Maps policy id to recorded outcomes FIFO. Null means live evaluation. */
+  policyTape: Map<string, string[]> | Record<string, string[]> | null = null;
+
+  consumeTapedPolicy(policyId: unknown): string | null {
+    const tape: unknown = (this as unknown as { policyTape: unknown }).policyTape;
+    if (tape === null || tape === undefined || typeof policyId !== "string") return null;
+    let queue: string[] | undefined;
+    if (tape instanceof Map) queue = (tape as Map<string, string[]>).get(policyId);
+    else queue = (tape as Record<string, string[]>)[policyId];
+    if (!queue || queue.length === 0) return null;
+    return queue.shift()!;
   }
 
   get traceId(): string {
@@ -789,11 +1128,9 @@ export class TraceRecorder {
     this.begun = true;
     this.beginTime = this.config.clock();
     this.manifest = manifest;
-    manifest.policies.forEach((policy, index) => {
-      if (!this.policyRefs.has(policy.id)) {
-        this.policyRefs.set(policy.id, `p-${index + 1}`);
-      }
-    });
+    for (const [pid, ref] of policyRefsFor(manifest.policies as unknown as { id: string }[])) {
+      if (!this.policyRefs.has(pid)) this.policyRefs.set(pid, ref);
+    }
   }
 
   /** Finalize and return the deterministic `.nemotrace` ZIP bytes. */
@@ -842,10 +1179,69 @@ export class TraceRecorder {
     return callId;
   }
 
+  recordModelRequest(modelCallId: string, request: Record<string, unknown> | null | undefined): void {
+    this.requireBegun();
+    if (!this.vault_enabled || request === null || request === undefined) return;
+    if (!this.config.vaultCapture.includeModelMessages) return;
+    const payload = _toJsonable({ ...request }) as Record<string, unknown>;
+    const scrubbed = this.scrubVaultValue(payload);
+    this.appendVaultRecord("model_request", scrubbed, { modelCallId, stageVisitId: this.currentVisit ?? undefined });
+  }
+
   /** Record safe model-response facts (counts only, never text). */
-  recordModelResponse(modelCallId: string, facts: { responseBytes?: number; toolCallCount?: number } = {}): void {
+  recordModelResponse(
+    modelCallId: string,
+    facts: { responseBytes?: number; toolCallCount?: number; response?: Record<string, unknown> | null } = {},
+  ): void {
     this.requireBegun();
     this.modelBytes.set(modelCallId, Math.max(0, Math.trunc(facts.responseBytes ?? 0)));
+    this.modelToolCalls.set(modelCallId, Math.max(0, Math.trunc(facts.toolCallCount ?? 0)));
+    if (!this.vault_enabled || facts.response === null || facts.response === undefined) return;
+    if (!this.config.vaultCapture.includeModelMessages) return;
+    const payload = _toJsonable({ ...facts.response }) as Record<string, unknown>;
+    if (!this.config.vaultCapture.includeReasoning) {
+      const reasoning = payload["reasoning"];
+      delete payload["reasoning"];
+      const isEmptyReasoning =
+        reasoning === null ||
+        reasoning === undefined ||
+        reasoning === "" ||
+        (Array.isArray(reasoning) && reasoning.length === 0) ||
+        (typeof reasoning === "object" && reasoning !== null && !Array.isArray(reasoning) && Object.keys(reasoning as Record<string, unknown>).length === 0);
+      if (!isEmptyReasoning) {
+        payload["reasoning"] = this.newMarker("private_content", reasoning);
+      }
+    }
+    const scrubbed = this.scrubVaultValue(payload);
+    this.appendVaultRecord("model_response", scrubbed, { modelCallId, stageVisitId: this.currentVisit ?? undefined });
+  }
+
+  recordRunInputs(inputs: Record<string, unknown> | null | undefined): void {
+    this.requireBegun();
+    if (!this.vault_enabled || inputs === null || inputs === undefined) return;
+    const payload = _toJsonable({ ...inputs });
+    const scrubbed = this.scrubVaultValue(payload);
+    this.appendVaultRecord("run_inputs", scrubbed);
+  }
+
+  recordPolicyEvaluation(
+    stageVisitId: string | null | undefined,
+    policyId: unknown,
+    bound: Record<string, unknown> | null | undefined,
+    outcome: string,
+  ): void {
+    this.requireBegun();
+    if (!this.vault_enabled) return;
+    if (!this.config.vaultCapture.includeTransitionPolicy) return;
+    if (outcome !== "allowed" && outcome !== "denied") throw new TraceError(`policy evaluation outcome must be allowed/denied, got ${JSON.stringify(outcome)}`);
+    const ref = this.policyRef(policyId);
+    const payload: Record<string, unknown> = {
+      policy_ref: ref,
+      outcome,
+      bound: this.scrubVaultValue(_toJsonable({ ...(bound ?? {}) })),
+    };
+    if (ref === null) payload["policy_ref"] = this.newMarker("private_content", policyId);
+    this.appendVaultRecord("policy_evaluation", payload, { stageVisitId: (stageVisitId ?? this.currentVisit) ?? undefined });
   }
 
   /** Assign the next run-local tool-call id. */
@@ -862,16 +1258,43 @@ export class TraceRecorder {
   }
 
   /** Note a tool result's safe type facts (the value stays private). */
-  recordToolResult(toolCallId: string, result: unknown): void {
+  recordToolResult(toolCallId: string, result: unknown, args?: Record<string, unknown> | null): void {
     this.requireBegun();
     this.toolErrors.delete(toolCallId);
     this.toolResultTypes.set(toolCallId, resultTypeSlug(result));
+    if (!this.vault_enabled) return;
+    if (!this.config.vaultCapture.includeToolResults) return;
+    const stashed = this.openToolCalls.get(toolCallId) ?? {};
+    const effectiveArgs = args ?? (stashed["args"] as Record<string, unknown> | undefined);
+    const payload: Record<string, unknown> = { result: _toJsonable(result) };
+    if (effectiveArgs !== null && effectiveArgs !== undefined) payload["args"] = _toJsonable({ ...effectiveArgs }) as unknown;
+    if (stashed["capability"] !== undefined) payload["capability"] = stashed["capability"];
+    if (stashed["tool_name"] !== undefined) payload["tool_name"] = stashed["tool_name"];
+    const scrubbed = this.scrubVaultValue(payload);
+    this.appendVaultRecord("tool_result", scrubbed, { toolCallId, stageVisitId: this.currentVisit ?? undefined });
   }
 
   /** Capture a tool failure's stable error taxonomy (no message). */
   recordToolError(toolCallId: string, exc: unknown): void {
     this.requireBegun();
-    this.toolErrors.set(toolCallId, stableError(exc));
+    const stable = stableError(exc);
+    this.toolErrors.set(toolCallId, stable);
+    if (!this.vault_enabled) return;
+    if (!this.config.vaultCapture.includeToolResults) return;
+    let message = "";
+    try {
+      message = String((exc as Error)?.message ?? String(exc)).slice(0, 4000);
+    } catch {
+      message = "";
+    }
+    const stashed = this.openToolCalls.get(toolCallId) ?? {};
+    const payload: Record<string, unknown> = {
+      error: { code: stable.code, type: stable.typeName },
+      message: this.scrubVaultValue(message),
+    };
+    if (stashed["args"] !== undefined) payload["args"] = this.scrubVaultValue(_toJsonable({ ...(stashed["args"] as Record<string, unknown>) }));
+    if (stashed["capability"] !== undefined) payload["capability"] = stashed["capability"];
+    this.appendVaultRecord("tool_result", payload, { toolCallId, stageVisitId: this.currentVisit ?? undefined });
   }
 
   /**
@@ -882,8 +1305,133 @@ export class TraceRecorder {
    */
   recordTransitionEvaluation(stageVisitId: string, candidates: readonly unknown[]): void {
     this.requireBegun();
-    this.transitionEvidence.push({ stageVisitId, candidates: [...candidates] });
+    const cleaned: Record<string, unknown>[] = [];
+    for (const raw of candidates as unknown[]) {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new TraceError("transition candidate must be an object");
+      const m = raw as Record<string, unknown>;
+      const to = m["to"];
+      if (typeof to !== "string") throw new TraceError("transition candidate requires a string 'to'");
+      cleaned.push({
+        to,
+        priority: Math.max(0, Math.trunc((m["priority"] as number) ?? 0) || 0),
+        reason: (m["reason"] as string) ?? "other",
+        matched: Boolean(m["matched"]),
+      });
+    }
+    this.transitionEvidence.push({ stageVisitId, candidates: cleaned });
+    if (!this.vault_enabled) return;
+    if (!this.config.vaultCapture.includeTransitionPolicy) return;
+    const pending = this.pendingTransitions.get(stageVisitId) ?? [];
+    pending.push({ candidates: cleaned });
+    this.pendingTransitions.set(stageVisitId, pending);
   }
+
+  private appendVaultRecord(
+    recordType: string,
+    payload: unknown,
+    opts: { eventSequence?: number; stageVisitId?: string; modelCallId?: string; toolCallId?: string } = {},
+  ): Record<string, unknown> {
+    if (!_VAULT_RECORD_TYPES.has(recordType)) throw new TraceError(`unknown vault record type ${JSON.stringify(recordType)}`);
+    this.vaultCount += 1;
+    const record: Record<string, unknown> = {
+      record_id: `v-${this.vaultCount}`,
+      record_type: recordType,
+      payload,
+    };
+    if (opts.eventSequence !== undefined) record["event_sequence"] = opts.eventSequence;
+    if (opts.stageVisitId !== undefined) record["stage_visit_id"] = opts.stageVisitId;
+    if (opts.modelCallId !== undefined) record["model_call_id"] = opts.modelCallId;
+    if (opts.toolCallId !== undefined) record["tool_call_id"] = opts.toolCallId;
+    this.vaultRecords.push(record);
+    return record;
+  }
+
+  private scrubVaultValue(value: unknown): unknown {
+    const scrubbed = this.scrubVaultNode(value);
+    const wrapper: Record<string, unknown> = { v: scrubbed };
+    for (let i = 0; i < MAX_MASK_PASSES; i++) {
+      const hits = scanStrings(wrapper, "", this.registry).filter((f) => f.rule === "registered_secret");
+      if (hits.length === 0) break;
+      this.setMarker(wrapper, hits[0].pointer, "credential");
+    }
+    // If still hits, replace whole value
+    if (scanStrings(wrapper, "", this.registry).some((f) => f.rule === "registered_secret")) {
+      wrapper["v"] = this.newMarker("credential", wrapper["v"]);
+    }
+    for (let i = 0; i < MAX_MASK_PASSES; i++) {
+      const findings = scanStrings(wrapper, "", this.registry).filter((f) => f.rule !== "registered_secret" && !vaultFindingExcused(wrapper as Record<string, unknown>, f));
+      if (findings.length === 0) break;
+      const finding = findings[0];
+      let reason: RedactionReason = "unapproved_field";
+      if (finding.rule === "home_path") reason = "absolute_path";
+      else if (CREDENTIAL_RULES.has(finding.rule)) reason = "credential";
+      this.setMarker(wrapper, finding.pointer, reason);
+    }
+    if (scanStrings(wrapper, "", this.registry).some((f) => f.rule !== "registered_secret" && !vaultFindingExcused(wrapper as Record<string, unknown>, f))) {
+      wrapper["v"] = this.newMarker("credential", wrapper["v"]);
+    }
+    const result = wrapper["v"];
+    // cleanup omit flag if any (not needed)
+    if (typeof result === "object" && result !== null && "_omit" in (result as Record<string, unknown>)) {
+      delete (result as Record<string, unknown>)["_omit"];
+    }
+    return result;
+  }
+
+  private scrubVaultNode(value: unknown): unknown {
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const mapping = value as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [rawKey, rawItem] of Object.entries(mapping)) {
+        const lowered = rawKey.toLowerCase();
+        if (_VAULT_CREDENTIAL_KEYS.has(lowered)) {
+          out[rawKey] = this.newMarker("credential", rawItem);
+        } else {
+          out[rawKey] = this.scrubVaultNode(rawItem);
+        }
+      }
+      return out;
+    }
+    if (Array.isArray(value)) return (value as unknown[]).map((v) => this.scrubVaultNode(v));
+    if (typeof value === "string") return this.scrubVaultText(value);
+    return value;
+  }
+
+  private scrubVaultText(text: string): unknown {
+    // Try alias matching using string prefix (web pathAliases are string prefixes)
+    const aliases = Object.entries(this.config.pathAliases).sort(([ ,a],[ ,b]) => b.length - a.length);
+    for (const [alias, root] of aliases) {
+      if (text === root || text.startsWith(`${root}/`)) {
+        const relative = text === root ? "" : text.slice(root.length + 1);
+        if (this.config.safePathAliases.has(alias)) {
+          return relative ? `${alias}/${relative}` : alias;
+        }
+        let ref = this.pathRefs.get(text);
+        if (ref === undefined) {
+          this.pathRefCount += 1;
+          ref = `path-${this.pathRefCount}`;
+          this.pathRefs.set(text, ref);
+        }
+        return ref;
+      }
+    }
+    // Unregistered absolute path -> opaque ref (detect via leading /)
+    if (text.startsWith("/") && text.length > 1) {
+      let ref = this.pathRefs.get(text);
+      if (ref === undefined) {
+        this.pathRefCount += 1;
+        ref = `path-${this.pathRefCount}`;
+        this.pathRefs.set(text, ref);
+      }
+      return ref;
+    }
+    return text;
+  }
+
+  // Python parity aliases (underscore prefix) for WS2 surface checks
+  _scrubVaultValue(value: unknown): unknown { return this.scrubVaultValue(value); }
+  _scrubVaultNode(value: unknown): unknown { return this.scrubVaultNode(value); }
+  _scrubVaultText(text: string): unknown { return this.scrubVaultText(text); }
 
   /**
    * Persist one trusted domain annotation (Phase 3). Known
@@ -1009,9 +1557,45 @@ export class TraceRecorder {
       this.visitSequences.set(visitSeq, arr);
     }
     if ((record as Record<string, unknown>).kind === "stage_completed") {
+      this.captureStageSnapshot(record, event);
       this.maybeEmitStageAnnotation(record, event);
     }
+    if ((record as Record<string, unknown>).kind === "transition_selected") {
+      this.flushTransitionEvidence(record, event);
+    }
     return record;
+  }
+
+  private captureStageSnapshot(record: Record<string, unknown>, event: WorkflowEvent): void {
+    if (!this.vault_enabled) return;
+    if (!this.config.vaultCapture.includeStageSnapshots) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = {
+        stage_id: event.stageId ?? (record["stage_id"] as string),
+        output: this.scrubVaultValue(_toJsonable({ ...(event.output ?? {}) })),
+      };
+    } catch {
+      payload = {
+        stage_id: event.stageId ?? (record["stage_id"] as string),
+        output: this.newMarker("private_content", event.output ?? {}),
+      };
+    }
+    const seq = typeof event.sequence === "number" && Number.isInteger(event.sequence) && event.sequence >= 1 ? event.sequence : undefined;
+    this.appendVaultRecord("stage_snapshot", payload, { eventSequence: seq, stageVisitId: record["stage_visit_id"] as string });
+  }
+
+  private flushTransitionEvidence(record: Record<string, unknown>, event: WorkflowEvent): void {
+    if (!this.vault_enabled) return;
+    const visit = record["stage_visit_id"] as string;
+    if (typeof visit !== "string") return;
+    const pending = this.pendingTransitions.get(visit);
+    if (!pending || pending.length === 0) return;
+    this.pendingTransitions.delete(visit);
+    const seq = typeof event.sequence === "number" && Number.isInteger(event.sequence) && event.sequence >= 1 ? event.sequence : undefined;
+    for (const item of pending) {
+      this.appendVaultRecord("transition_evaluation", { candidates: item.candidates }, { eventSequence: seq, stageVisitId: visit });
+    }
   }
 
   private recordAnnotationWarning(record: Record<string, unknown>, reason: string): void {
@@ -1121,9 +1705,14 @@ export class TraceRecorder {
 
   private popModel(visit: string): string {
     const queue = this.pendingModels.get(visit);
-    if (queue && queue.length > 0) return queue.shift() as string;
-    this.modelCount += 1;
-    return `m-${this.modelCount}`;
+    let callId: string;
+    if (queue && queue.length > 0) callId = queue.shift() as string;
+    else {
+      this.modelCount += 1;
+      callId = `m-${this.modelCount}`;
+    }
+    this.lastModelId.set(visit, callId);
+    return callId;
   }
 
   /** Consume the next begun-but-unstarted tool id for a started event. */
@@ -1279,9 +1868,13 @@ export class TraceRecorder {
     const record = this.base(event, { stageVisitId: visit });
     // The schema requires model_call_id on every model_retry. A retry can
     // legally arrive with no pending call (e.g. a tool-error retry emitted
-    // after model_completed consumed the call id), so synthesize a fresh
-    // run-local id rather than emitting a schema-invalid record.
+    // after model_completed consumed the call id). Reuse that consumed id:
+    // the retry announces the failure of the attempt it follows, which
+    // already has vault request/response evidence, so semantic verification
+    // stays complete. Synthesize a fresh id only when the visit has no
+    // prior model call at all.
     let callId = this.peekModel(visit);
+    if (callId === null) callId = this.lastModelId.get(visit) ?? null;
     if (callId === null) {
       this.modelCount += 1;
       callId = `m-${this.modelCount}`;
@@ -1301,6 +1894,14 @@ export class TraceRecorder {
     const visit = this.currentOrNewVisit();
     const record = this.base(event, { stageVisitId: visit });
     const callId = this.popTool(visit);
+    if (this.vault_enabled) {
+      this.openToolCalls.set(callId, {
+        args: event.args,
+        capability: event.capability,
+        tool_name: event.toolName,
+        stage_visit_id: visit,
+      });
+    }
     record.tool_call_id = callId;
     const capability = event.capability ?? "unknown";
     record.capability = capability;
@@ -1654,15 +2255,23 @@ export class TraceRecorder {
     const parts = pointer.split("/").slice(1).map(unescapePointerSegment);
     let current: unknown = record;
     for (const part of parts.slice(0, -1)) {
-      if (current !== null && typeof current === "object" && part in (current as Record<string, unknown>)) {
+      if (current !== null && typeof current === "object" && !Array.isArray(current) && part in (current as Record<string, unknown>)) {
         current = (current as Record<string, unknown>)[part];
+      } else if (Array.isArray(current) && /^\d+$/.test(part) && Number(part) < (current as unknown[]).length) {
+        current = (current as unknown[])[Number(part)];
       } else {
         return;
       }
     }
     const last = parts[parts.length - 1];
-    if (current !== null && typeof current === "object" && last in (current as Record<string, unknown>)) {
+    if (current !== null && typeof current === "object" && !Array.isArray(current) && last in (current as Record<string, unknown>)) {
       (current as Record<string, unknown>)[last] = this.newMarker(reason, (current as Record<string, unknown>)[last]);
+      if (!Array.isArray(record.redacted_fields)) record.redacted_fields = [];
+      const fields = record.redacted_fields as string[];
+      if (!fields.includes(pointer)) fields.push(pointer);
+    } else if (Array.isArray(current) && /^\d+$/.test(last) && Number(last) < (current as unknown[]).length) {
+      (current as unknown[])[Number(last)] = this.newMarker(reason, (current as unknown[])[Number(last)]);
+      if (!Array.isArray(record.redacted_fields)) record.redacted_fields = [];
       const fields = record.redacted_fields as string[];
       if (!fields.includes(pointer)) fields.push(pointer);
     }
@@ -1709,18 +2318,28 @@ export class TraceRecorder {
       provenance.model = model;
     }
     const exits = manifest ? [...manifest.exitStageIds].sort() : [];
+    const vaultEnabled = this.vault_enabled;
+    const capture: Record<string, unknown> = vaultEnabled
+      ? {
+          profile: "replay",
+          vault_present: true,
+          publication_eligible: false,
+          redaction_policy: REDACTION_POLICY,
+          scanner: { status: "passed", ruleset: SCANNER_RULESET },
+        }
+      : {
+          profile: "audit",
+          vault_present: false,
+          publication_eligible: false,
+          redaction_policy: REDACTION_POLICY,
+          scanner: { status: "passed", ruleset: SCANNER_RULESET },
+        };
     const manifestObj: Record<string, unknown> = {
       format: TRACE_FORMAT,
       trace_id: this.config.traceId,
       created_at: (this.beginTime ?? this.config.clock()).toISOString(),
       status,
-      capture: {
-        profile: "audit",
-        vault_present: false,
-        publication_eligible: false,
-        redaction_policy: REDACTION_POLICY,
-        scanner: { status: "passed", ruleset: SCANNER_RULESET },
-      },
+      capture,
       workflow: {
         id: workflowId,
         ir_version: prov.irVersion,
@@ -1761,12 +2380,20 @@ export class TraceRecorder {
       [EVENTS_PATH]: eventsBytes,
       [SUMMARY_PATH]: textEncoder.encode(canonicalStringify(summaryObj)),
     };
+    if (vaultEnabled) {
+      await this.sealVaultEntries(payloads, manifestObj);
+    }
     const integrityEntries = await Promise.all(
       Object.entries(payloads)
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
         .map(async ([path, data]) => ({
           path,
-          media_type: path.endsWith(".ndjson") ? "application/x-ndjson" : "application/json",
+          media_type:
+            path === VAULT_ENC_PATH
+              ? "application/octet-stream"
+              : path.endsWith(".ndjson")
+                ? "application/x-ndjson"
+                : "application/json",
           uncompressed_bytes: data.length,
           sha256: await sha256Hex(data),
         })),
@@ -1828,9 +2455,134 @@ export class TraceRecorder {
     };
   }
 
+  private manifestSnapshotForVault(): Record<string, unknown> {
+    if (this.manifest === null) throw new TraceError("workflow manifest snapshot must be an object");
+    const m = this.manifest;
+    const guardToSnapshot = (g: unknown): Record<string, unknown> => {
+      const guard = g as Record<string, unknown>;
+      const kind = guard["kind"] as string;
+      // Python dataclass includes all fields cond, left, ref, right, plus ref etc. Emit null for missing.
+      // Mirror Python's dataclasses.asdict output: always include cond, left, ref, right as null when absent.
+      if (kind === "always") {
+        return { cond: null, kind: "always", left: null, ref: null, right: null };
+      }
+      if (kind === "has_value" || kind === "missing") {
+        return { kind, ref: guard["ref"] ? _toJsonable(guard["ref"]) : null, cond: null, left: null, right: null };
+      }
+      if (kind === "eq") {
+        return { kind, left: _toJsonable(guard["left"]), right: _toJsonable(guard["right"]), cond: null, ref: null };
+      }
+      if (kind === "if") {
+        return { kind, cond: _toJsonable(guard["cond"]), left: null, ref: null, right: null };
+      }
+      return { cond: null, kind, left: null, ref: null, right: null };
+    };
+    const manifestDict: Record<string, unknown> = {
+      workflow_id: m.workflowId,
+      entry_stage_id: m.entryStageId,
+      exit_stage_ids: [...m.exitStageIds].sort(),
+      inputs: m.inputs.map((i) => {
+        const rec = i as unknown as Record<string, unknown>;
+        const name = (rec["id"] as string) ?? (rec["name"] as string) ?? "";
+        return { name, type: rec["type"] };
+      }),
+      capabilities: [...m.capabilities].sort(),
+      policies: m.policies.map((p) => ({
+        id: p.id,
+        kind: p.kind,
+        trigger: { capability: p.trigger.capability, bind: Object.fromEntries([...p.trigger.bind]) },
+        requires: [...p.requires].map((r) => ({ capability: r.capability, args: Object.fromEntries([...r.args].map(([k, v]) => [k, _toJsonable(v)])) })),
+        condition: p.condition ? _toJsonable(p.condition) : null,
+      })),
+      stages: m.stages.map((s) => ({
+        id: s.id,
+        prompt: s.prompt,
+        reads: s.reads.map((r) => ({ ref: _toJsonable(r.ref), optional: r.optional })),
+        writes: s.writes.map((w) => ({ name: w.name, type: w.type, optional: w.optional })),
+        requires: [...s.requires].sort(),
+        transitions: s.transitions.map((t) => ({
+          to: t.to,
+          priority: t.priority,
+          reason: t.reason,
+          guard: guardToSnapshot(t.guard),
+        })),
+        execution: {
+          kind: s.execution.kind,
+          capability: s.execution.capability ?? null,
+          args: s.execution.args ? Object.fromEntries([...s.execution.args].map(([k, v]) => [k, _toJsonable(v)])) : {},
+        },
+      })),
+    };
+    return {
+      manifest: manifestDict,
+      ir_sha256: this.config.provenance.irSha256,
+      workflow_id: m.workflowId,
+    };
+  }
+
+  private async sealVaultEntries(payloads: Record<string, Uint8Array>, manifestObj: Record<string, unknown>): Promise<void> {
+    const captureCfg = this.config.vaultCapture;
+    if (this.config.vaultPassphrase === null) throw new TraceError("trace profile 'replay' requires vaultPassphrase");
+    if (captureCfg.includeIr) {
+      const snapshot = this.manifestSnapshotForVault();
+      this.appendVaultRecord("full_workflow_ir", snapshot);
+    }
+    // Validate shape
+    for (const rec of this.vaultRecords) {
+      const err = vaultRecordShapeError(rec);
+      if (err !== null) throw new TraceError(err);
+    }
+    const lines: Uint8Array[] = [];
+    for (const rec of this.vaultRecords) {
+      lines.push(textEncoder.encode(canonicalStringify(rec) + "\n"));
+    }
+    const plaintext = (() => {
+      const total = lines.reduce((s, b) => s + b.length, 0);
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const b of lines) { out.set(b, off); off += b.length; }
+      return out;
+    })();
+    if (plaintext.length > captureCfg.maxVaultBytes) {
+      throw new TraceError(`vault plaintext exceeds maxVaultBytes (${plaintext.length} > ${captureCfg.maxVaultBytes})`);
+    }
+    // Belt-and-braces scan of vault plaintext records
+    const problems: string[] = [];
+    for (let idx = 0; idx < this.vaultRecords.length; idx++) {
+      const rec = this.vaultRecords[idx] as Record<string, unknown>;
+      for (const finding of scanStrings(rec, "", this.registry)) {
+        if (vaultFindingExcused(rec, finding)) continue;
+        problems.push(`vault:${idx + 1}:${finding.pointer} [${finding.rule}]`);
+      }
+    }
+    if (problems.length > 0) {
+      const detail = problems.slice(0, 10).join("; ");
+      throw new TraceError(`trace scanner blocked vault finalization with ${problems.length} finding(s): ${detail}`);
+    }
+    const manifestBytes = payloads[MANIFEST_PATH]!;
+    const eventsBytes = payloads[EVENTS_PATH]!;
+    const graphBytes = payloads[GRAPH_PATH]!;
+    const workflow = manifestObj["workflow"] as Record<string, unknown>;
+    const irSha = (workflow["ir_sha256"] as string | null) ?? VAULT_NULL_IR_SHA256;
+    const aadDict: Record<string, unknown> = {
+      events_sha256: await sha256Hex(eventsBytes),
+      format: VAULT_AAD_FORMAT,
+      ir_sha256: irSha || VAULT_NULL_IR_SHA256,
+      manifest_sha256: await sha256Hex(manifestBytes),
+      trace_id: this.config.traceId,
+      workflow_graph_sha256: await sha256Hex(graphBytes),
+    };
+    const aad = textEncoder.encode(canonicalStringify(aadDict));
+    const { salt, nonce, sealed } = await encryptVaultRecords(plaintext, this.config.vaultPassphrase!, aad);
+    const metaObj = vaultMetaObject({ salt, nonce, aadDict });
+    payloads[VAULT_ENC_PATH] = sealed;
+    payloads[VAULT_META_PATH] = textEncoder.encode(canonicalStringify(metaObj));
+  }
+
   private finalScan(entries: Record<string, Uint8Array>): void {
     const problems: string[] = [];
     for (const [path, data] of Object.entries(entries)) {
+      if (path === VAULT_ENC_PATH) continue;
       if (path.endsWith(".ndjson")) {
         const lines = textDecoder.decode(data).split("\n");
         lines.forEach((line, index) => {
@@ -1879,6 +2631,18 @@ export class TraceRecorder {
 
 export class NoOpTraceRecorder {
   /** Zero-cost recorder used when tracing is disabled. */
+  readonly vault_enabled = false;
+  readonly vaultEnabled = false;
+  policyTape: Map<string, string[]> | Record<string, string[]> | null = null;
+  consumeTapedPolicy(policyId: unknown): string | null {
+    const tape: unknown = (this as unknown as { policyTape: unknown }).policyTape;
+    if (tape === null || tape === undefined || typeof policyId !== "string") return null;
+    let queue: string[] | undefined;
+    if (tape instanceof Map) queue = (tape as Map<string, string[]>).get(policyId);
+    else queue = (tape as Record<string, string[]>)[policyId];
+    if (!queue || queue.length === 0) return null;
+    return queue.shift()!;
+  }
   beginRun(_manifest: WorkflowManifest): void {}
   async finishRun(_status: TraceStatus): Promise<Uint8Array> {
     return new Uint8Array(0);
@@ -1889,11 +2653,14 @@ export class NoOpTraceRecorder {
   beginModelCall(_stageId = "", _stageVisitId?: string): string {
     return "";
   }
-  recordModelResponse(_modelCallId: string, _facts: { responseBytes?: number; toolCallCount?: number } = {}): void {}
+  recordModelRequest(_modelCallId: string, _request: unknown): void {}
+  recordModelResponse(_modelCallId: string, _facts: { responseBytes?: number; toolCallCount?: number; response?: unknown } = {}): void {}
+  recordRunInputs(_inputs: unknown): void {}
+  recordPolicyEvaluation(_stageVisitId: unknown, _policyId: unknown, _bound: unknown, _outcome: string): void {}
   beginToolCall(_stageId = "", _stageVisitId?: string): string {
     return "";
   }
-  recordToolResult(_toolCallId: string, _result: unknown): void {}
+  recordToolResult(_toolCallId: string, _result: unknown, _args?: unknown): void {}
   recordToolError(_toolCallId: string, _exc: unknown): void {}
   recordRunError(_exc: unknown): void {}
   recordTransitionEvaluation(_stageVisitId: string, _candidates: readonly unknown[]): void {}
@@ -1960,13 +2727,18 @@ export function resolveTraceRecorder(
 // Archive writing + reading + verification
 // ---------------------------------------------------------------------------
 
-/** Deterministic ZIP assembly: sorted names, fixed epoch, DEFLATE level 6. */
+/** Deterministic ZIP assembly: sorted names, fixed epoch, DEFLATE level 6 (STORE for vault.enc). */
 export function writeArchive(entries: Record<string, Uint8Array>): Uint8Array {
-  const sorted: Record<string, Uint8Array> = {};
+  const sorted: Record<string, Uint8Array | [Uint8Array, { level: number; mtime: Date }]> = {};
   for (const name of Object.keys(entries).sort()) {
-    sorted[name] = entries[name];
+    const data = entries[name]!;
+    if (name === VAULT_ENC_PATH) {
+      sorted[name] = [data, { level: 0, mtime: ZIP_EPOCH }];
+    } else {
+      sorted[name] = [data, { level: ZIP_DEFLATE_LEVEL, mtime: ZIP_EPOCH }];
+    }
   }
-  return zipSync(sorted, { level: ZIP_DEFLATE_LEVEL, mtime: ZIP_EPOCH });
+  return zipSync(sorted as unknown as Record<string, Uint8Array>, { mtime: ZIP_EPOCH });
 }
 
 interface ZipEntryMeta {
@@ -2041,7 +2813,7 @@ export function readArchiveEntries(data: Uint8Array): Record<string, Uint8Array>
   if (names.some((n, i) => n !== sorted[i]) || new Set(names).size !== names.length) {
     throw new TraceError("trace archive entries must be sorted and unique");
   }
-  const allowed = new Set([...AUDIT_ENTRY_PATHS, INTEGRITY_PATH]);
+  const allowed = new Set([...AUDIT_ENTRY_PATHS, INTEGRITY_PATH, ...VAULT_ENTRY_PATHS]);
   for (const name of names) {
     if (!allowed.has(name)) throw new TraceError(`trace archive has unexpected entry: ${name}`);
     if (name.includes("\\") || name.startsWith("/") || name.split("/").some((s) => s === "" || s === "." || s === "..")) {
@@ -2050,7 +2822,9 @@ export function readArchiveEntries(data: Uint8Array): Record<string, Uint8Array>
   }
   let total = 0;
   for (const meta of metas) {
-    if (meta.method !== 8) {
+    if (meta.name === VAULT_ENC_PATH) {
+      if (meta.method !== 0) throw new TraceError(`trace archive entry ${meta.name} must use STORE`);
+    } else if (meta.method !== 8) {
       throw new TraceError(`trace archive entry ${meta.name} must use DEFLATE`);
     }
     if (meta.uncompressedSize > LIMIT_UNCOMPRESSED_ENTRY_BYTES) {
@@ -2085,19 +2859,19 @@ export async function verifyArchive(data: Uint8Array): Promise<VerificationRepor
   try {
     entries = readArchiveEntries(data);
   } catch (error) {
-    return { ok: false, contentIdentity: null, warnings: [], errors: [String(error)] };
+    return { ok: false, contentIdentity: null, warnings: [], errors: [String(error)], integrity: "failed", structural: "failed", semantic: "not-evaluated", replayability: "none" };
   }
   const errors: string[] = [];
   const warnings: string[] = [];
   for (const required of [MANIFEST_PATH, GRAPH_PATH, EVENTS_PATH, INTEGRITY_PATH]) {
     if (!(required in entries)) errors.push(`missing required entry ${required}`);
   }
-  if (errors.length > 0) return { ok: false, contentIdentity: null, warnings, errors };
+  if (errors.length > 0) return { ok: false, contentIdentity: null, warnings, errors, integrity: "failed", structural: "failed", semantic: "not-evaluated", replayability: "none" };
   let integrity: Record<string, unknown>;
   try {
     integrity = parseJsonStrict(textDecoder.decode(entries[INTEGRITY_PATH])) as Record<string, unknown>;
   } catch (error) {
-    return { ok: false, contentIdentity: null, warnings: [], errors: [`integrity.json unparsable: ${String(error)}`] };
+    return { ok: false, contentIdentity: null, warnings: [], errors: [`integrity.json unparsable: ${String(error)}`], integrity: "failed", structural: "failed", semantic: "not-evaluated", replayability: "none" };
   }
   const indexed = new Map<string, { sha256: unknown; uncompressed_bytes: unknown }>();
   if (Array.isArray(integrity.entries)) {
@@ -2157,7 +2931,7 @@ export async function verifyArchive(data: Uint8Array): Promise<VerificationRepor
   try {
     recomputed = await sha256Hex(textEncoder.encode(canonicalStringify(identityObj)));
   } catch (error) {
-    return { ok: false, contentIdentity: null, warnings, errors: [...errors, `content identity failed: ${String(error)}`] };
+    return { ok: false, contentIdentity: null, warnings, errors: [...errors, `content identity failed: ${String(error)}`], integrity: "failed", structural: "failed", semantic: "not-evaluated", replayability: "none" };
   }
   const contentIdentity = integrity.content_identity;
   if (recomputed !== contentIdentity) errors.push("content identity mismatch");
@@ -2491,11 +3265,291 @@ export async function verifyArchive(data: Uint8Array): Promise<VerificationRepor
   } catch (error) {
     errors.push(`event validation failed: ${String(error)}`);
   }
+  // -- Phase 4: capture/vault consistency (errors) ----------------------
+  let vaultPresent = false;
+  let captureProfile: unknown = null;
+  if (manifest !== null && typeof manifest === "object" && !Array.isArray(manifest)) {
+    const cap = (manifest as Record<string, unknown>)["capture"];
+    if (cap !== null && typeof cap === "object" && !Array.isArray(cap)) {
+      vaultPresent = (cap as Record<string, unknown>)["vault_present"] === true;
+      captureProfile = (cap as Record<string, unknown>)["profile"];
+    }
+  }
+  const hasVaultEnc = VAULT_ENC_PATH in entries;
+  const hasVaultMeta = VAULT_META_PATH in entries;
+  if (hasVaultEnc !== hasVaultMeta) {
+    errors.push("vault entries must co-occur: private/vault.enc + private/vault.meta.json");
+  }
+  const hasVault = hasVaultEnc && hasVaultMeta;
+  if (vaultPresent && !hasVault) errors.push("manifest capture declares vault_present but vault entries are missing");
+  if (hasVault && !vaultPresent) errors.push("vault entries present but manifest capture has vault_present=false");
+  if (captureProfile === "replay" && !vaultPresent) errors.push("replay profile requires vault_present=true");
+  if (captureProfile === "publication" && hasVault) errors.push("publication profile forbids a vault");
+  if (captureProfile !== "audit" && captureProfile !== "replay" && captureProfile !== "publication") {
+    errors.push(`manifest capture has invalid profile ${JSON.stringify(captureProfile)}`);
+  }
+  // -- Phase 4: structural path-shape check (warnings) ----
+  const structuralNotes: string[] = [];
+  try {
+    const g = graph as Record<string, unknown> | null;
+    const nodes = g?.["nodes"];
+    if (Array.isArray(nodes)) {
+      const nodeIds = new Set<string>();
+      for (const n of nodes as unknown[]) {
+        if (n !== null && typeof n === "object" && !Array.isArray(n)) nodeIds.add((n as Record<string, unknown>)["id"] as string);
+      }
+      const edges = new Set<string>();
+      const transList = (g as Record<string, unknown>)["transitions"];
+      if (Array.isArray(transList)) {
+        for (const t of transList as unknown[]) {
+          if (t !== null && typeof t === "object" && !Array.isArray(t)) {
+            const tm = t as Record<string, unknown>;
+            edges.add(`${String(tm["from"])}->${String(tm["to"])}`);
+          }
+        }
+      }
+      const unknownStages = new Set<string>();
+      const badEdges = new Set<string>();
+      for (const line of eventLines) {
+        let ev: unknown;
+        try { ev = parseJsonStrict(line); } catch { continue; }
+        if (ev === null || typeof ev !== "object" || Array.isArray(ev)) continue;
+        const m = ev as Record<string, unknown>;
+        const kind = m["kind"] as string;
+        if (kind === "stage_started") {
+          const sid = m["stage_id"] as string;
+          if (typeof sid === "string" && !nodeIds.has(sid)) unknownStages.add(sid);
+        }
+        if (kind === "transition_selected") {
+          const edge = `${String(m["stage_id"])}->${String(m["transition_to"])}`;
+          if (!edges.has(edge)) badEdges.add(edge);
+        }
+      }
+      for (const s of [...unknownStages].sort().slice(0, 10)) structuralNotes.push(`ledger references stage ${JSON.stringify(s)} absent from workflow graph`);
+      if (unknownStages.size > 10) structuralNotes.push(`... and ${unknownStages.size - 10} more unknown stages`);
+      for (const e of [...badEdges].sort().slice(0, 10)) structuralNotes.push(`ledger transition ${JSON.stringify(e)} absent from workflow graph`);
+      if (badEdges.size > 10) structuralNotes.push(`... and ${badEdges.size - 10} more unknown transitions`);
+    }
+  } catch (e) {
+    structuralNotes.push(`structural check skipped: ${String(e)}`);
+  }
+  warnings.push(...structuralNotes);
+  // -- Phase 4: level summary -------------------------------------------
+  const integrityMarkers = ["hash mismatch", "length mismatch", "content identity", "missing from integrity", "integrity index", "integrity.json", "integrity contains", "missing required entry", "unparsable"];
+  const ledgerMarkers = ["events.ndjson", "workflow graph", "manifest"];
+  const integrityFailed = errors.some((e) => integrityMarkers.some((m) => e.includes(m)));
+  const ledgerFailed = errors.some((e) => ledgerMarkers.some((m) => e.includes(m)));
+  const integrityLevel = integrityFailed ? "failed" : "passed";
+  let structuralLevel: string;
+  if (ledgerFailed) structuralLevel = "failed";
+  else if (structuralNotes.length > 0) structuralLevel = "passed-with-warnings";
+  else structuralLevel = "passed";
+  const ok = errors.length === 0;
+  let replayability: string;
+  if (ok && hasVault) replayability = "taped-replay";
+  else if (ok) replayability = "playback-only";
+  else replayability = "none";
   return {
-    ok: errors.length === 0,
-    contentIdentity: errors.length === 0 ? (contentIdentity as string) : null,
+    ok,
+    contentIdentity: ok ? (contentIdentity as string) : null,
     warnings,
     errors,
+    integrity: integrityLevel,
+    structural: structuralLevel,
+    semantic: "not-evaluated",
+    replayability,
+  };
+}
+
+export function checkVaultMeta(meta: unknown): Record<string, unknown> {
+  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) throw new TraceError("vault metadata must be an object");
+  const d = meta as Record<string, unknown>;
+  if (d["format"] !== VAULT_META_FORMAT) throw new TraceError("vault metadata format mismatch");
+  if (d["codec"] !== VAULT_CODEC) throw new TraceError("vault uses an unsupported codec");
+  const passphrase = d["passphrase"];
+  if (passphrase === null || typeof passphrase !== "object" || Array.isArray(passphrase)) throw new TraceError("vault metadata passphrase descriptor invalid");
+  const pp = passphrase as Record<string, unknown>;
+  if (pp["encoding"] !== "UTF-8" || pp["normalization"] !== "NFC") throw new TraceError("vault metadata passphrase descriptor invalid");
+  const kdf = d["kdf"];
+  if (kdf === null || typeof kdf !== "object" || Array.isArray(kdf)) throw new TraceError("vault uses an unsupported KDF");
+  const kd = kdf as Record<string, unknown>;
+  if (kd["name"] !== VAULT_KDF_NAME || kd["iterations"] !== VAULT_KDF_ITERATIONS || kd["derived_key_bits"] !== VAULT_DERIVED_KEY_BITS) throw new TraceError("vault uses an unsupported KDF");
+  const cipher = d["cipher"];
+  if (cipher === null || typeof cipher !== "object" || Array.isArray(cipher)) throw new TraceError("vault uses an unsupported cipher");
+  const cd = cipher as Record<string, unknown>;
+  if (cd["name"] !== "AES-256-GCM" || cd["tag_length_bits"] !== VAULT_TAG_BITS || cd["tag_placement"] !== "ciphertext_suffix") throw new TraceError("vault uses an unsupported cipher");
+  const plaintext = d["plaintext"];
+  if (plaintext === null || typeof plaintext !== "object" || Array.isArray(plaintext)) throw new TraceError("vault metadata plaintext descriptor invalid");
+  const pd = plaintext as Record<string, unknown>;
+  if (pd["media_type"] !== VAULT_PLAINTEXT_MEDIA_TYPE || pd["encoding"] !== "UTF-8" || pd["compression"] !== "none") throw new TraceError("vault metadata plaintext descriptor invalid");
+  const aad = d["aad"];
+  if (aad === null || typeof aad !== "object" || Array.isArray(aad)) throw new TraceError("vault metadata AAD descriptor invalid");
+  const ad = aad as Record<string, unknown>;
+  if (ad["format"] !== VAULT_AAD_FORMAT) throw new TraceError("vault metadata AAD descriptor invalid");
+  for (const n of ["trace_id", "ir_sha256", "manifest_sha256", "events_sha256", "workflow_graph_sha256"]) {
+    if (!(n in ad)) throw new TraceError(`vault metadata AAD missing ${JSON.stringify(n)}`);
+  }
+  return d;
+}
+
+async function expectedVaultAad(entries: Record<string, Uint8Array>, manifest: Record<string, unknown>): Promise<{ aad: Uint8Array; aadDict: Record<string, unknown> }> {
+  const workflow = (manifest["workflow"] as Record<string, unknown>) ?? {};
+  const aadDict: Record<string, unknown> = {
+    events_sha256: await sha256Hex(entries[EVENTS_PATH]!),
+    format: VAULT_AAD_FORMAT,
+    ir_sha256: (workflow["ir_sha256"] as string) || VAULT_NULL_IR_SHA256,
+    manifest_sha256: await sha256Hex(entries[MANIFEST_PATH]!),
+    trace_id: manifest["trace_id"],
+    workflow_graph_sha256: await sha256Hex(entries[GRAPH_PATH]!),
+  };
+  return { aad: textEncoder.encode(canonicalStringify(aadDict)), aadDict };
+}
+
+function checkVaultEvidence(entries: Record<string, Uint8Array>, records: Record<string, unknown>[]): string[] {
+  const problems: string[] = [];
+  const modelIds = new Set<string>();
+  const toolIds = new Set<string>();
+  const transitionVisits = new Set<string>();
+  for (const rec of records) {
+    const rtype = rec["record_type"] as string;
+    if (rtype === "model_request" || rtype === "model_response") {
+      const mid = rec["model_call_id"] as string;
+      if (typeof mid === "string") modelIds.add(mid);
+    } else if (rtype === "tool_result") {
+      const tid = rec["tool_call_id"] as string;
+      if (typeof tid === "string") toolIds.add(tid);
+    } else if (rtype === "transition_evaluation") {
+      const visit = rec["stage_visit_id"] as string;
+      if (typeof visit === "string") transitionVisits.add(visit);
+    }
+  }
+  const lines = textDecoder.decode(entries[EVENTS_PATH]!).split("\n").filter((l) => l.trim() !== "");
+  for (const line of lines) {
+    let ev: unknown;
+    try { ev = parseJsonStrict(line); } catch { continue; }
+    if (ev === null || typeof ev !== "object" || Array.isArray(ev)) continue;
+    const m = ev as Record<string, unknown>;
+    const kind = m["kind"] as string;
+    if (kind === "model_completed" || kind === "model_retry") {
+      const mid = m["model_call_id"] as string;
+      if (typeof mid === "string" && !modelIds.has(mid)) problems.push(`vault missing model evidence for ${mid}`);
+    } else if (kind === "tool_call_completed" || kind === "tool_call_failed") {
+      const tid = m["tool_call_id"] as string;
+      if (typeof tid === "string" && !toolIds.has(tid)) problems.push(`vault missing tool evidence for ${tid}`);
+    } else if (kind === "transition_selected") {
+      const visit = m["stage_visit_id"] as string;
+      if (typeof visit === "string" && !transitionVisits.has(visit)) problems.push(`vault missing transition evidence for visit ${visit}`);
+    }
+  }
+  return problems.slice(0, 50);
+}
+
+export async function unlockArchive(data: Uint8Array, passphrase: string | Uint8Array): Promise<{ records: Record<string, unknown>[]; report: VerificationReport }> {
+  const report = await verifyArchive(data);
+  if (!report.ok) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "archive verification failed"] } };
+  }
+  if (report.replayability !== "taped-replay") {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "archive has no replay vault"] } };
+  }
+  let entries: Record<string, Uint8Array>;
+  try {
+    entries = readArchiveEntries(data);
+  } catch (e) {
+    const msg = String(e);
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, msg] } };
+  }
+  let metaRaw: unknown;
+  let manifestRaw: unknown;
+  try {
+    metaRaw = parseJsonStrict(textDecoder.decode(entries[VAULT_META_PATH]!));
+    manifestRaw = parseJsonStrict(textDecoder.decode(entries[MANIFEST_PATH]!));
+  } catch (e) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, `vault metadata invalid: ${String(e)}`] } };
+  }
+  let meta: Record<string, unknown>;
+  try {
+    meta = checkVaultMeta(metaRaw);
+  } catch (e) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, `vault metadata invalid: ${String(e)}`] } };
+  }
+  if (manifestRaw === null || typeof manifestRaw !== "object" || Array.isArray(manifestRaw)) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "vault metadata invalid: manifest must be an object"] } };
+  }
+  const manifest = manifestRaw as Record<string, unknown>;
+  const kdf = (meta["kdf"] as Record<string, unknown>);
+  const cipher = (meta["cipher"] as Record<string, unknown>);
+  let salt: Uint8Array;
+  let nonce: Uint8Array;
+  try {
+    salt = b64urlDecode(kdf["salt_base64url"] as string, "salt", VAULT_SALT_BYTES);
+    nonce = b64urlDecode(cipher["nonce_base64url"] as string, "nonce", VAULT_NONCE_BYTES);
+  } catch (e) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, `vault metadata invalid: ${String(e)}`] } };
+  }
+  let pwBytes: Uint8Array | null;
+  try {
+    pwBytes = normalizePassphrase(passphrase as string | Uint8Array);
+  } catch {
+    pwBytes = null;
+  }
+  if (pwBytes === null) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "vault unlock failed"] } };
+  }
+  const { aad: expectedAad } = await expectedVaultAad(entries, manifest);
+  const storedAad = meta["aad"] as Record<string, unknown>;
+  let aadOk = true;
+  for (const [name, digestPromise] of [
+    ["manifest_sha256", sha256Hex(entries[MANIFEST_PATH]!)],
+    ["events_sha256", sha256Hex(entries[EVENTS_PATH]!)],
+    ["workflow_graph_sha256", sha256Hex(entries[GRAPH_PATH]!)],
+  ] as const) {
+    const digest = await digestPromise;
+    if ((storedAad as Record<string, unknown>)[name] !== digest) aadOk = false;
+  }
+  if (!aadOk || (storedAad as Record<string, unknown>)["trace_id"] !== manifest["trace_id"]) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "vault unlock failed"] } };
+  }
+  let plaintext: Uint8Array;
+  try {
+    plaintext = await decryptVaultRecords(entries[VAULT_ENC_PATH]!, pwBytes, expectedAad, { salt, nonce });
+  } catch (e) {
+    const msg = e instanceof TraceError ? e.message : "vault unlock failed";
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, msg] } };
+  }
+  let rawLines = plaintext.length === 0 ? [] : textDecoder.decode(plaintext).split("\n").filter((l) => l.trim() !== "");
+  let parsed: unknown[] = [];
+  try {
+    parsed = rawLines.map((line) => parseJsonStrict(line));
+  } catch (e) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, `vault invalid: ${String(e)}`] } };
+  }
+  if (parsed.length > LIMIT_EVENT_COUNT) {
+    return { records: [], report: { ...report, ok: false, semantic: "failed", errors: [...report.errors, "vault invalid: record count exceeds budget"] } };
+  }
+  const records: Record<string, unknown>[] = [];
+  for (let idx = 0; idx < parsed.length; idx++) {
+    const rec = parsed[idx];
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
+      return { records: [], report: { ...report, semantic: "failed", errors: [...report.errors, `vault invalid: record ${idx + 1} must be an object`] } };
+    }
+    const err = vaultRecordShapeError(rec);
+    if (err !== null) {
+      return { records: [], report: { ...report, semantic: "failed", errors: [...report.errors, `vault invalid: ${err}`] } };
+    }
+    records.push(rec as Record<string, unknown>);
+  }
+  const semanticErrors = checkVaultEvidence(entries, records);
+  const semantic = semanticErrors.length === 0 ? "passed" : "failed";
+  return {
+    records,
+    report: {
+      ...report,
+      semantic,
+      warnings: report.warnings,
+      errors: [...report.errors, ...semanticErrors],
+      ok: report.ok && semanticErrors.length === 0,
+    },
   };
 }
 
