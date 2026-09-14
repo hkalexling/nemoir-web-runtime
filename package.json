@@ -1,6 +1,6 @@
 {
   "name": "@nemoir/web-runtime",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "TypeScript runtime core for NemoIR — execute compiled agent workflows in the browser as structured state machines with tool orchestration, policy enforcement, model-backed stage execution, and live event streaming.",
   "license": "MIT",
   "repository": {
@@ -19,6 +19,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "nemotrace-js": "./bin/nemotrace-js.mjs"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
@@ -28,6 +31,7 @@
   },
   "dependencies": {
     "@mlc-ai/web-llm": "^0.2.84",
+    "fflate": "^0.8.3",
     "jsonrepair": "^3.15.0",
     "zod": "^3.23.0"
   },
@@ -61,6 +65,7 @@
   "files": [
     "dist",
     "src",
+    "bin",
     "README.md"
   ]
 }

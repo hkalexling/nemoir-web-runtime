@@ -141,10 +141,8 @@ export class ToolRegistry implements Iterable<Tool> {
   }
 
   constructor(tools: Iterable<Tool>) {
-    for (const t of tools) {
-      // Validate against the catalog before registration
-      validateTool(t);
-
+    const toolList = [...tools];
+    for (const t of toolList) {
       if (this.byName.has(t.name)) {
         throw new ToolValidationError(`duplicate tool name: ${t.name}`);
       }
@@ -156,6 +154,15 @@ export class ToolRegistry implements Iterable<Tool> {
       }
       list.push(t);
     }
+    // Validate after registration through the overridable hook, mirroring the
+    // Python `self._validate_tools(...)` dispatch (synthetic registries such as
+    // taped replay skip catalog checks for their stub tools).
+    this._validateTools(toolList);
+  }
+
+  /** Validate tools against the capability catalog (overridable). */
+  protected _validateTools(tools: readonly Tool[]): void {
+    for (const t of tools) validateTool(t);
   }
 
   /** Returns the first tool for a capability, or undefined. */

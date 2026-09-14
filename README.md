@@ -157,6 +157,90 @@ for await (const event of agent.stream(inputs)) {
 The generated `agent.ts` imports from `@nemoir/web-runtime` and wires the
 runtime against the compiled `workflow.json`.
 
+## Capturing and exporting a trace in the browser
+
+A browser host passes a trace configuration and reads the finished archive
+from the recorder it held:
+
+```ts
+import { Agent } from "./agent";
+import { downloadTraceArchive } from "@nemoir/web-runtime";
+
+const agent = new Agent({ modelAdapter, trace: { profile: "audit" } });
+await agent.run(inputs);
+const bytes = agent.lastTraceArchiveBytes;       // in-memory, never persisted
+if (bytes) downloadTraceArchive(bytes, "run");   // user gesture only
+```
+
+Generated apps do this by default: every run captures a redacted `audit`
+archive, and the runner UI renders an **Export trace (.nemotrace)** action.
+The archive stays in memory until the user exports it; the runtime never
+uploads it, never downloads it automatically, and never writes it to browser
+storage. `Agent.lastTraceRecorder` exposes the recorder itself for hosts that
+want more than the bytes (for example durable staging of their own).
+
+## Trace verification (`nemotrace-js`)
+
+The runtime records **NemoTrace** archives (`*.nemotrace`): one redacted,
+portable execution record per run, optionally with an encrypted replay vault
+(WebCrypto PBKDF2/AES-GCM). The bundled `nemotrace-js` CLI verifies an archive
+and reports its levels — integrity, structural, semantic, and replayability —
+reusing the same library reports as the browser viewer:
+
+The artifact format, capture profiles, verification and replay levels, and
+publication gates are documented in the public compiler docs:
+[Trace artifacts](https://github.com/hkalexling/nemoir/blob/master/docs/trace.md).
+
+```bash
+npx nemotrace-js verify run.nemotrace                          # public levels
+npx nemotrace-js verify run.nemotrace --unlock env:VAULT_PW    # + semantic evidence
+npx nemotrace-js verify run.nemotrace --replay file:./pw.txt   # + taped replay
+```
+
+`--unlock` and `--replay` are mutually exclusive and take a passphrase source:
+`env:VAR`, `file:PATH`, or `prompt` (interactive TTY; piped stdin is read
+without echo). Output is a stable `key: value` report on stdout; the exit code
+is `0` when the requested level passed, `1` when it failed, and `2` for usage
+errors. Output is byte-identical to the Python `nemotrace` CLI for the shared
+fixtures under `docs/trace/schema/test-vectors/cli/`. Passphrase values, vault
+plaintext, and stack traces are never printed.
+
+Taped replay re-executes the recorded state machine with recorded model/tool
+fixtures only — no provider calls, no real tool effects. It is deterministic
+playback of captured evidence, not a live rerun.
+### Publishing a trace (`publication-v1`)
+
+An `audit` archive is safe-by-default local capture, not automatically safe to
+post. Publication is a separate, reviewed transform that produces one stricter,
+vault-free `publication` artifact:
+
+```bash
+# 1. project for review (writes a disclosure report; publishes nothing)
+npx nemotrace-js scan-publication runs/<id>/run.nemotrace
+
+# 2. bind your review to the projection digest it reported
+npx nemotrace-js attest-publication \
+  --report runs/<id>/run.nemotrace.publication-report.json \
+  --reviewer "Your Name" --license CC-BY-4.0 \
+  --consent "I reviewed the disclosure report and certify this trace is safe to publish."
+
+# 3. write the attested archive (+ its report sidecar)
+npx nemotrace-js prepare-publication runs/<id>/run.nemotrace published/run.nemotrace \
+  --attest runs/<id>/run.nemotrace.publication-report.json.attestation.json
+```
+
+Publication refuses a vault-bearing or already-published source, an
+interrupted run, incomplete compiler provenance, a projection the attestation
+does not cover, and any `secrets-v1` scanner finding. By default it drops
+static tool names and replaces alias-relative paths with opaque `path-N` refs;
+`--allow-tool-name NAME` (repeatable) and `--keep-relative-paths` opt
+individual review decisions back in, and each choice changes the projection
+digest you are asked to attest. Reports and attestations are local review
+artifacts — they are never written inside the archive.
+
+Redaction reduces risk; it cannot prove that reviewed identifiers or approved
+scalar metrics are non-sensitive. Human review remains mandatory.
+
 ## Development
 
 ```bash
