@@ -39,7 +39,7 @@ export const REDACTION_POLICY = "audit-v1";
 export const SCANNER_RULESET = "secrets-v1";
 export const RUNTIME_NAME = "nemoir-runtime";
 // Keep in sync with package.json (enforced by trace.test.ts).
-export const RUNTIME_VERSION = "0.6.0";
+export const RUNTIME_VERSION = "0.6.1";
 
 export const MANIFEST_PATH = "manifest.json";
 export const GRAPH_PATH = "public/workflow.graph.json";
