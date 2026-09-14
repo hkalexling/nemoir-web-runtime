@@ -155,7 +155,12 @@ function validateWriteType(
   fieldName: string,
   stageId: string,
 ): void {
-  if (writeType === "string") {
+  // The web runtime has no filesystem: path values are opaque strings (the
+  // same JSON form Python's ``pathlib.Path`` outputs serialize to). Compiled
+  // web apps still reject path writes in the IR validator; this branch exists
+  // so browser taped replay of a Python-targeted trace can execute stages
+  // that declare path outputs.
+  if (writeType === "string" || writeType === "path") {
     if (typeof value !== "string") {
       throw new StageOutputValidationError(
         `Stage '${stageId}' output field '${fieldName}': expected string, got ${typeof value}`,

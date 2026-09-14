@@ -22,7 +22,7 @@ class StageAdapter {
   }
 }
 
-function buildManifest(deny: boolean): WorkflowManifest {
+function buildManifest(deny: boolean, withPathOutput = false): WorkflowManifest {
   const literal = (v: unknown) => ({ kind: "literal" as const, type: typeof v === "boolean" ? "bool" : "string", value: v } as any);
   return {
     workflowId: "ReplayE2E",
@@ -40,7 +40,9 @@ function buildManifest(deny: boolean): WorkflowManifest {
         id: "A",
         prompt: "",
         reads: [],
-        writes: [{ name: "text", type: "string", optional: false }],
+        writes: withPathOutput
+          ? [{ name: "text", type: "string", optional: false }, { name: "location", type: "path", optional: false }]
+          : [{ name: "text", type: "string", optional: false }],
         requires: new Set(["fs.read"]),
         transitions: [{ to: "B", priority: 0, reason: "explicit_transition", guard: { kind: "always" as const } }],
         execution: { kind: "tool" as const, capability: "fs.read", args: new Map([["path", literal("/work/a.txt") as any]]) },
@@ -67,13 +69,16 @@ function buildManifest(deny: boolean): WorkflowManifest {
   };
 }
 
-function registry(calls: [string, string][]): ToolRegistry {
+function registry(calls: [string, string][], withPathOutput = false): ToolRegistry {
   const reader: Tool = {
     name: "reader",
     capability: "fs.read",
     description: "r",
     inputSchema: { path: "string" },
-    handler: async (args) => { calls.push(["fs.read", String(args.path)]); return { text: "hello" }; },
+    handler: async (args) => {
+      calls.push(["fs.read", String(args.path)]);
+      return withPathOutput ? { text: "hello", location: "$workspace/a.txt" } : { text: "hello" };
+    },
   };
   const writer: Tool = {
     name: "writer",
@@ -107,11 +112,11 @@ function compositeExecutor(adapter: StageAdapter, reg: ToolRegistry): any {
   };
 }
 
-async function recordTmp(deny: boolean): Promise<{ bytes: Uint8Array; adapter: StageAdapter; calls: [string, string][] }> {
+async function recordTmp(deny: boolean, withPathOutput = false): Promise<{ bytes: Uint8Array; adapter: StageAdapter; calls: [string, string][] }> {
   const adapter = new StageAdapter();
   const calls: [string, string][] = [];
-  const reg = registry(calls);
-  const runtime = new WorkflowRuntime({ manifest: buildManifest(deny), tools: reg, stageExecutor: compositeExecutor(adapter, reg) });
+  const reg = registry(calls, withPathOutput);
+  const runtime = new WorkflowRuntime({ manifest: buildManifest(deny, withPathOutput), tools: reg, stageExecutor: compositeExecutor(adapter, reg) });
   const recorder = new TraceRecorder({
     profile: "replay",
     provenance: { frontend: "replay-e2e", target: "web", compilerVersion: "replay-e2e", irVersion: "0.1", irSha256: `sha256:${"cd".repeat(32)}` },
@@ -152,6 +157,17 @@ describe("replay", () => {
     const report = await replayTrace(bytes, "replay-e2e-passphrase");
     expect(report.matched, String(report.divergences)).toBe(true);
     expect(report.replayedStatus).toBe("failed");
+  });
+
+  it("path-typed stage outputs replay with string semantics", async () => {
+    // Regression: validateWriteType had no `path` branch, so recording or
+    // replaying any stage with a path-typed output (Python-targeted traces)
+    // failed with "unsupported type 'path'".
+    const { bytes } = await recordTmp(false, true);
+    const report = await replayTrace(bytes, "replay-e2e-passphrase");
+    expect(report.matched, String(report.divergences)).toBe(true);
+    expect(report.divergences).toEqual([]);
+    expect(report.replayedStatus).toBe("complete");
   });
 
   it("taped replay refuses audit archive", async () => {
