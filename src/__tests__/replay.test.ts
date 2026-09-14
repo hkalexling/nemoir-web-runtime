@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { WorkflowRuntime } from "../runtime.js";
 import { ModelStageExecutor } from "../models.js";
@@ -207,5 +209,22 @@ describe("replay", () => {
           { name: "bad", capability: "fs.read", description: "", inputSchema: {}, handler: async () => ({}) },
         ]),
     ).toThrow(/missing required parameter/);
+  });
+
+  it("refuses a manifest whose deterministic stage cannot be served", async () => {
+    // Regression (M-C1): Python's `WorkflowRuntime.__init__` eagerly selects a
+    // deterministic tool and raises when the degenerate manifest has none.
+    // This port resolves tools lazily, so replay must perform the same
+    // construction check: reporting "diverged" would overclaim that the
+    // recorded path re-executed.
+    const root = join(__dirname, "..", "..", "..", "..");
+    const degenerate = new Uint8Array(
+      readFileSync(
+        join(root, "docs", "trace", "schema", "test-vectors", "cli", "vault-fake-run.nemotrace"),
+      ),
+    );
+    await expect(replayTrace(degenerate, "phase4-vault-fake-passphrase-01")).rejects.toThrow(
+      /no registered tool satisfies the required input params and output schema/,
+    );
   });
 });

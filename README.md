@@ -157,6 +157,28 @@ for await (const event of agent.stream(inputs)) {
 The generated `agent.ts` imports from `@nemoir/web-runtime` and wires the
 runtime against the compiled `workflow.json`.
 
+## Capturing and exporting a trace in the browser
+
+A browser host passes a trace configuration and reads the finished archive
+from the recorder it held:
+
+```ts
+import { Agent } from "./agent";
+import { downloadTraceArchive } from "@nemoir/web-runtime";
+
+const agent = new Agent({ modelAdapter, trace: { profile: "audit" } });
+await agent.run(inputs);
+const bytes = agent.lastTraceArchiveBytes;       // in-memory, never persisted
+if (bytes) downloadTraceArchive(bytes, "run");   // user gesture only
+```
+
+Generated apps do this by default: every run captures a redacted `audit`
+archive, and the runner UI renders an **Export trace (.nemotrace)** action.
+The archive stays in memory until the user exports it; the runtime never
+uploads it, never downloads it automatically, and never writes it to browser
+storage. `Agent.lastTraceRecorder` exposes the recorder itself for hosts that
+want more than the bytes (for example durable staging of their own).
+
 ## Trace verification (`nemotrace-js`)
 
 The runtime records **NemoTrace** archives (`*.nemotrace`): one redacted,

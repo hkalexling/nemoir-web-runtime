@@ -8,7 +8,7 @@
 import { parseJsonStrict } from "./canonical.js";
 import { ToolInvocationError } from "./errors.js";
 import type { WorkflowEvent, WorkflowEventSink } from "./events.js";
-import type { WorkflowManifest, StageSpec, PolicySpec, TransitionSpec, ReadSpec, RequiredCapabilitySpec, ExprSpec, GuardSpec, RefSpec } from "./manifest.js";
+import type { WorkflowManifest, StageSpec, PolicySpec, TransitionSpec, ReadSpec, RequiredCapabilitySpec, ExprSpec, GuardSpec, RefSpec, WriteSpec } from "./manifest.js";
 import { ModelStageExecutor } from "./models.js";
 import { WorkflowRuntime } from "./runtime.js";
 import type { RunOptions } from "./runtime-types.js";
@@ -287,6 +287,62 @@ function markerAwareEqual(replayed: unknown, recorded: unknown): boolean {
 // Export helpers for tests (mirror python internal exposure)
 export const _testHelpers = { fixturePlaceholder, unmarkFixture, markerAwareEqual, isRedactionMarker };
 
+/**
+ * Whether a taped stub's output schema can satisfy a stage's declared writes.
+ * Mirrors Python `tool_satisfies_stage_outputs` / `_type_satisfies_write`:
+ * a missing schema satisfies only optional writes, and `path` accepts either
+ * the `path` or `string` spelling.
+ */
+function toolSatisfiesStageOutputs(
+  outputSchema: Record<string, string> | null | undefined,
+  writes: readonly WriteSpec[],
+): boolean {
+  if (outputSchema === null || outputSchema === undefined) {
+    return writes.every((write) => write.optional);
+  }
+  for (const write of writes) {
+    if (write.optional) continue;
+    const declared = outputSchema[write.name];
+    if (declared === undefined) return false;
+    const matches = write.type === "path" ? declared === "path" || declared === "string" : declared === write.type;
+    if (!matches) return false;
+  }
+  return true;
+}
+
+/**
+ * Mirror Python's eager `WorkflowRuntime.__init__` deterministic-tool check.
+ *
+ * Python selects a concrete tool for every tool-execution stage at runtime
+ * construction and raises `WorkflowValidationError` when none satisfies the
+ * stage's required input params and output schema. This port resolves tools
+ * lazily, so taped replay performs the same check up front: a manifest whose
+ * deterministic stages are unservable cannot produce a replay at all, and
+ * reporting "diverged" would overclaim that the recorded path re-executed.
+ * `TapedReplayError` surfaces as the shared CLI `replay: error` state.
+ *
+ * The input-param filter is intentionally absent: taped stubs declare no
+ * required params, so `_non_defaulted_tool_params` is empty for them in
+ * Python too, and only the output shape can exclude a candidate. Taped
+ * registries hold one stub per capability, so Python's "multiple tools"
+ * branch cannot trigger here.
+ */
+function validateDeterministicStages(manifest: WorkflowManifest, tools: TapedToolRegistry): void {
+  for (const stage of manifest.stages) {
+    if (stage.execution.kind !== "tool") continue;
+    const capability = stage.execution.capability ?? "";
+    const candidates = tools
+      .toolsForCapabilities([capability])
+      .filter((tool) => toolSatisfiesStageOutputs(tool.outputSchema, stage.writes));
+    if (candidates.length === 0) {
+      throw new TapedReplayError(
+        `Deterministic stage '${stage.id}' (capability '${capability}'): ` +
+          "no registered tool satisfies the required input params and output schema",
+      );
+    }
+  }
+}
+
 function inferStubType(value: unknown): string {
   if (typeof value === "boolean") return "bool";
   if (typeof value === "number") return "number";
@@ -385,13 +441,17 @@ export class TapedToolRegistry extends ToolRegistry {
         const t = WRITE_TYPE_MAP[String(kind)] ?? "json";
         inputSchema[n] = t as import("./tools.js").ToolParamType;
       }
+      // Output write types are carried verbatim so replay's construction
+      // pre-flight can mirror Python's `tool_satisfies_stage_outputs`.
+      const outputSchema: Record<string, string> = {};
+      for (const [n, kind] of Object.entries(outputs)) outputSchema[n] = String(kind);
       stubs.push({
         name: `taped-${cap}`,
         capability: cap,
         description: "Taped replay stub (no live effects).",
         inputSchema,
         handler: async () => { throw new TapedReplayError("taped tools serve fixtures through TapedToolRegistry.call"); },
-        outputSchema: Object.keys(outputs).length>0 ? {} as unknown as Record<string, string> : null,
+        outputSchema: Object.keys(outputSchema).length > 0 ? outputSchema : null,
       });
     }
     super(stubs.length>0 ? stubs : [{ name: "taped-dummy", capability: "fs.read", description: "dummy", inputSchema: { path: "string" }, handler: async () => ({}) }]);
@@ -581,6 +641,9 @@ export async function replayTrace(archive: Uint8Array, passphrase: string | Uint
     }
   }
   const tapedTools = new TapedToolRegistry(toolFixtures, stubSchemas);
+  // Fail closed before executing: an unservable deterministic stage means the
+  // replay runtime cannot be constructed (Python raises at construction).
+  validateDeterministicStages(manifest, tapedTools);
   const tapedModel = new TapedModelAdapter(modelByStage);
   // Taped deny-policy outcomes: runtime reproduces recorded allow/deny instead of re-evaluating.
   const tapeRecorder = new NoOpTraceRecorder();

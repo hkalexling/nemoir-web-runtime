@@ -2308,7 +2308,9 @@ export class TraceRecorder {
       complete,
       frontend: prov.frontend,
       target: ["python", "web", "manual", "imported"].includes(prov.target) ? prov.target : "manual",
-      compilerVersion: prov.compilerVersion,
+      // Canonical wire spelling (`manifest.schema.json`); the host-facing
+      // `HostProvenance` type is camelCase, the archive is snake_case.
+      compiler_version: prov.compilerVersion,
       runtime: { name: RUNTIME_NAME, version: RUNTIME_VERSION },
     };
     if (this.config.model !== undefined) {
@@ -2665,6 +2667,10 @@ export class NoOpTraceRecorder {
     return queue.shift()!;
   }
   beginRun(_manifest: WorkflowManifest): void {}
+  /** Symmetric with `TraceRecorder`: a disabled recorder never has bytes. */
+  get archiveBytes(): null {
+    return null;
+  }
   async finishRun(_status: TraceStatus): Promise<Uint8Array> {
     return new Uint8Array(0);
   }

@@ -128,6 +128,169 @@ const ATTESTATION_SOURCE_KEYS = new Set(["content_identity", "trace_id"]);
 const ATTESTATION_PROJECTION_KEYS = new Set(["sha256"]);
 const OPTIONS_KEYS = new Set(["allow_tool_names", "keep_relative_paths"]);
 
+// Strict publication-v1 allowlists. A forward-compatible *reader* tolerates
+// unknown fields (schema README §1); the publication transform must not,
+// because a published artifact asserts what it contains. Sets mirror
+// `docs/trace/schema/public-event.schema.json` exactly.
+const PUBLIC_EVENT_KEYS = new Set([
+  "kind",
+  "run_id",
+  "sequence",
+  "timestamp",
+  "stage_id",
+  "stage_visit_id",
+  "model_call_id",
+  "tool_call_id",
+  "channel",
+  "text",
+  "capability",
+  "tool_name",
+  "args",
+  "output",
+  "result",
+  "error",
+  "transition_to",
+  "metadata",
+  "redacted_fields",
+  "anchor_sequence",
+  "annotation",
+]);
+const METADATA_KEYS = new Set([
+  "approval",
+  "attempt",
+  "byte_count",
+  "category",
+  "code_bytes",
+  "command_id",
+  "content_omitted",
+  "cost_usd",
+  "denied",
+  "duration_ms",
+  "entry",
+  "error_code",
+  "error_type",
+  "exit_class",
+  "input_bytes",
+  "input_tokens",
+  "max_retries",
+  "method",
+  "origin_class",
+  "output_tokens",
+  "path_ref",
+  "policy_kind",
+  "policy_ref",
+  "priority",
+  "reason",
+  "required_capabilities",
+  "response_bytes",
+  "result_status",
+  "result_type",
+  "root_class",
+  "status_class",
+  "step_count",
+  "total_tokens",
+  "value_type",
+  "workflow_id",
+]);
+// `args` names are open tool-domain data: the audit writer mirrors arbitrary
+// argument names as markers for `user.*` / `browser.*` capabilities, so an
+// unrecognized name is dropped with a redaction pointer instead of refusing
+// an otherwise-valid source.
+const PUBLIC_ARGS_KEYS = new Set([
+  "path",
+  "path_ref",
+  "root_class",
+  "content",
+  "command_id",
+  "method",
+  "origin_class",
+  "key",
+  "value",
+  "code",
+  "input",
+  "headers",
+  "body",
+  "question",
+  "message",
+  "options",
+]);
+const ARGS_MARKER_KEYS = new Set([
+  "content",
+  "key",
+  "value",
+  "code",
+  "input",
+  "headers",
+  "body",
+  "question",
+  "message",
+  "options",
+]);
+const NON_ANNOTATION_KEYS = new Set(["annotation", "anchor_sequence"]);
+const METADATA_BOOLS = new Set(["approval", "content_omitted", "denied"]);
+const METADATA_ENUMS = new Map<string, ReadonlySet<string>>([
+  ["exit_class", new Set(["success", "failure", "signal", "timeout"])],
+  ["policy_kind", new Set(["before", "deny"])],
+  ["value_type", new Set(["string", "number", "boolean", "object", "array", "null", "binary"])],
+  [
+    "reason",
+    new Set([
+      "explicit_transition",
+      "backward_ref_loop",
+      "next_stage_required_input_available",
+      "skip_next_stage_required_input_missing",
+      "fallthrough",
+      "other",
+    ]),
+  ],
+]);
+const METADATA_INT_MINIMUMS = new Map<string, number>([
+  ["attempt", 1],
+  ["byte_count", 0],
+  ["code_bytes", 0],
+  ["duration_ms", 0],
+  ["input_bytes", 0],
+  ["input_tokens", 0],
+  ["max_retries", 0],
+  ["output_tokens", 0],
+  ["priority", 0],
+  ["response_bytes", 0],
+  ["step_count", 0],
+  ["total_tokens", 0],
+]);
+const METADATA_PATTERNS = new Map<string, RegExp>([
+  ["category", /^[a-z][a-z0-9_]*$/],
+  ["command_id", /^[A-Za-z0-9][A-Za-z0-9._:-]*$/],
+  ["error_code", /^[a-z][a-z0-9_]*$/],
+  ["error_type", /^[A-Za-z][A-Za-z0-9_]*$/],
+  ["method", /^[A-Z]+$/],
+  ["origin_class", /^[A-Za-z0-9][A-Za-z0-9._:-]*$/],
+  ["path_ref", /^path-[1-9][0-9]*$/],
+  ["policy_ref", /^p-[1-9][0-9]*$/],
+  ["result_status", /^[a-z][a-z0-9_]*$/],
+  ["result_type", /^[a-z][a-z0-9_]*$/],
+  ["root_class", /^\$[a-z][a-z0-9_]*$/],
+  ["status_class", /^[1-5]xx$/],
+]);
+const METADATA_MAX_LENGTHS = new Map<string, number>([
+  ["category", 64],
+  ["command_id", 128],
+  ["entry", 256],
+  ["error_code", 64],
+  ["error_type", 128],
+  ["method", 16],
+  ["origin_class", 128],
+  ["result_status", 64],
+  ["result_type", 64],
+  ["workflow_id", 256],
+]);
+// Bounds for the few `public_args` values that are plain strings rather than
+// opaque markers.
+const MAX_ARGS_PATH_LEN = 512;
+const MAX_ARGS_METHOD_LEN = 16;
+const MAX_ARGS_CLASS_LEN = 128;
+const MAX_CAPABILITY_NAME_LEN = 128;
+
 const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const TRACE_ID_RE = /^[0-9a-f]{32}$/;
@@ -297,6 +460,151 @@ function requireKeys(
   }
 }
 
+/** True for a `common.schema.json` redaction marker (opaque by design). */
+function isMarker(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const marker = value as Record<string, unknown>;
+  return marker["$redacted"] !== null && typeof marker["$redacted"] === "object";
+}
+
+/** The closed `public_scalar` set: null, boolean, finite number, or marker. */
+function publicScalarOk(value: unknown): boolean {
+  if (value === null || typeof value === "boolean") return true;
+  if (typeof value === "number") {
+    return Number.isFinite(value) && (!Number.isInteger(value) || Math.abs(value) <= Number.MAX_SAFE_INTEGER);
+  }
+  return isMarker(value);
+}
+
+/** Per-key shape check mirroring `public-event.schema.json` metadata. */
+function metadataValueOk(key: string, value: unknown): boolean {
+  if (METADATA_BOOLS.has(key)) return typeof value === "boolean";
+  const enums = METADATA_ENUMS.get(key);
+  if (enums !== undefined) return typeof value === "string" && enums.has(value);
+  const minimum = METADATA_INT_MINIMUMS.get(key);
+  if (minimum !== undefined) {
+    return typeof value === "number" && Number.isInteger(value) && value >= minimum;
+  }
+  if (key === "cost_usd") {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  }
+  if (key === "required_capabilities") {
+    return (
+      Array.isArray(value) &&
+      (value as unknown[]).every(
+        (item) => typeof item === "string" && item.length >= 1 && item.length <= MAX_CAPABILITY_NAME_LEN,
+      )
+    );
+  }
+  const pattern = METADATA_PATTERNS.get(key);
+  if (pattern !== undefined) {
+    const limit = METADATA_MAX_LENGTHS.get(key);
+    return (
+      typeof value === "string" &&
+      pattern.test(value) &&
+      (limit === undefined || value.length <= limit)
+    );
+  }
+  const limit = METADATA_MAX_LENGTHS.get(key);
+  if (limit !== undefined) {
+    return typeof value === "string" && value.length >= 1 && value.length <= limit;
+  }
+  return false; // unreachable for allowlisted keys; fail closed if a set drifts.
+}
+
+/** Per-key shape check mirroring `public-event.schema.json` public_args. */
+function argValueOk(key: string, value: unknown): boolean {
+  if (ARGS_MARKER_KEYS.has(key)) return isMarker(value);
+  if (key === "path") {
+    return typeof value === "string" && value.startsWith("$") && value.length <= MAX_ARGS_PATH_LEN;
+  }
+  if (key === "root_class") {
+    return typeof value === "string" && /^\$[a-z][a-z0-9_]*$/.test(value);
+  }
+  if (key === "path_ref") {
+    return typeof value === "string" && /^path-[1-9][0-9]*$/.test(value);
+  }
+  if (key === "method") {
+    return typeof value === "string" && /^[A-Z]+$/.test(value) && value.length <= MAX_ARGS_METHOD_LEN;
+  }
+  if (key === "command_id" || key === "origin_class") {
+    return (
+      typeof value === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) &&
+      value.length <= MAX_ARGS_CLASS_LEN
+    );
+  }
+  return false; // unreachable for allowlisted keys; fail closed if a set drifts.
+}
+
+/**
+ * Enforce the `publication-v1` nested allowlists on one ledger record.
+ *
+ * The reader tolerates forward-compatible fields; publication refuses them:
+ * a field this transform does not classify must never reach a published
+ * artifact. `args` names are the one exception (open tool-domain names are
+ * dropped with a redaction pointer), and annotation payloads are already
+ * shape-gated by `verifyArchive`.
+ */
+function validateRecordShape(record: Record<string, unknown>, redacted: string[]): void {
+  requireKeys(record, PUBLIC_EVENT_KEYS, "source ledger record", [
+    "kind",
+    "run_id",
+    "timestamp",
+    "redacted_fields",
+  ]);
+  if (record["kind"] !== "annotation") {
+    const present = [...NON_ANNOTATION_KEYS].filter((key) => key in record).sort();
+    if (present.length > 0) {
+      throw new PublicationError(
+        `publication source ledger record of kind ${reprLike(record["kind"])} ` +
+          `carries annotation fields ${reprLike(present)}`,
+      );
+    }
+  }
+  const metadata = record["metadata"];
+  if (metadata !== undefined && metadata !== null) {
+    const metadataMap = asDict(metadata, "source ledger metadata");
+    requireKeys(metadataMap, METADATA_KEYS, "source ledger metadata");
+    for (const key of Object.keys(metadataMap).sort()) {
+      if (!metadataValueOk(key, metadataMap[key])) {
+        throw new PublicationError(
+          `publication source ledger metadata field ${reprLike(key)} ` +
+            "does not match the publication-v1 shape",
+        );
+      }
+    }
+  }
+  const output = record["output"];
+  if (output !== undefined && output !== null) {
+    const outputMap = asDict(output, "source ledger output");
+    for (const key of Object.keys(outputMap).sort()) {
+      if (!publicScalarOk(outputMap[key])) {
+        throw new PublicationError(
+          `publication source ledger output field ${reprLike(key)} ` +
+            "does not match the publication-v1 shape",
+        );
+      }
+    }
+  }
+  const args = record["args"];
+  if (args !== undefined && args !== null) {
+    const argsMap = asDict(args, "source ledger args");
+    for (const key of Object.keys(argsMap).sort()) {
+      if (!PUBLIC_ARGS_KEYS.has(key)) {
+        redacted.push(`/args/${key}`);
+        continue;
+      }
+      if (!argValueOk(key, argsMap[key])) {
+        throw new PublicationError(
+          `publication source ledger args field ${reprLike(key)} ` +
+            "does not match the publication-v1 shape",
+        );
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Source validation
 // ---------------------------------------------------------------------------
@@ -459,7 +767,12 @@ function projectArgs(
   state: ProjectionState,
   redacted: string[],
 ): Record<string, unknown> {
-  const projected: Record<string, unknown> = { ...args };
+  // Unrecognized argument names were already reported by validateRecordShape
+  // and are dropped here rather than refused (args names are open data).
+  const projected: Record<string, unknown> = {};
+  for (const key of Object.keys(args)) {
+    if (PUBLIC_ARGS_KEYS.has(key)) projected[key] = args[key];
+  }
   const path = projected["path"];
   if (typeof path === "string" && !state.options.keep_relative_paths) {
     delete projected["path"];
@@ -477,6 +790,7 @@ function projectRecord(
 ): Record<string, unknown> {
   const projected: Record<string, unknown> = { ...record, run_id: runId };
   const fields = asStringList(record["redacted_fields"] ?? [], "source redacted_fields");
+  validateRecordShape(record, fields);
   const toolName = projected["tool_name"];
   if (typeof toolName === "string") {
     if (state.options.allow_tool_names.includes(toolName)) {

@@ -223,8 +223,38 @@ describe("trace recorder", () => {
     const output = completedStages[0].output as Record<string, { $redacted: { reason: string } }>;
     expect(output.note.$redacted.reason).toBe("private_content");
 
-    const manifest = JSON.parse(Buffer.from(entries["manifest.json"]).toString("utf8")) as Record<string, never>;
-    expect((manifest.status as unknown) as string).toBe("complete");
+    const manifest = JSON.parse(Buffer.from(entries["manifest.json"]).toString("utf8")) as {
+      status: string;
+      provenance: Record<string, unknown>;
+      workflow: Record<string, unknown>;
+      capture: Record<string, unknown>;
+    };
+    expect(manifest.status).toBe("complete");
+    // Canonical wire keys are snake_case; `HostProvenance` is camelCase only
+    // inside the runtime. A camelCase leak here made web-produced archives
+    // unpublishable (the publication transform refuses unknown fields).
+    expect(Object.keys(manifest.provenance).sort()).toEqual([
+      "compiler_version",
+      "complete",
+      "frontend",
+      "runtime",
+      "target",
+    ]);
+    expect(manifest.provenance["compiler_version"]).toBe("0.5.0");
+    expect(Object.keys(manifest.workflow).sort()).toEqual([
+      "entry",
+      "exits",
+      "id",
+      "ir_sha256",
+      "ir_version",
+    ]);
+    expect(Object.keys(manifest.capture).sort()).toEqual([
+      "profile",
+      "publication_eligible",
+      "redaction_policy",
+      "scanner",
+      "vault_present",
+    ]);
 
     const report = await verifyArchive(bytes as Uint8Array);
     expect(report.errors).toEqual([]);

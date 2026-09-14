@@ -339,3 +339,112 @@ describe("publication refusals", () => {
     ).rejects.toThrow(/does not cover this projection|scanner blocked export/);
   });
 });
+
+// A forward-compatible reader tolerates unknown fields; the publication
+// transform must not. These tests poison a structurally valid audit archive
+// with ordinary (non-secret-pattern) private text and prove the transform
+// refuses or drops it instead of republishing it.
+describe("publication-v1 nested allowlists (H-S1)", () => {
+  async function poisonedSource(
+    mutate: (events: Record<string, Record<string, unknown>>) => void,
+  ): Promise<Uint8Array> {
+    return rebuildSource(mutate);
+  }
+
+  it("refuses an unknown metadata field", async () => {
+    const poisoned = await poisonedSource((events) => {
+      const first = events["0"]!;
+      first["metadata"] = {
+        ...(first["metadata"] as Record<string, unknown>),
+        private_note: "patient narrative: seasonal allergies",
+      };
+    });
+    await expect(
+      scanPublication("poisoned.nemotrace", poisoned, {}, "poisoned.nemotrace"),
+    ).rejects.toThrow(/refusing to republish unknown structure/);
+  });
+
+  it("refuses an out-of-shape metadata value", async () => {
+    const poisoned = await poisonedSource((events) => {
+      const first = events["0"]!;
+      first["metadata"] = { ...(first["metadata"] as Record<string, unknown>), duration_ms: "fast" };
+    });
+    await expect(
+      scanPublication("poisoned.nemotrace", poisoned, {}, "poisoned.nemotrace"),
+    ).rejects.toThrow(/metadata field 'duration_ms' does not match the publication-v1 shape/);
+  });
+
+  it("refuses free text in an output scalar", async () => {
+    const poisoned = await poisonedSource((events) => {
+      for (const record of Object.values(events)) {
+        if (record["output"] !== undefined && record["output"] !== null) {
+          (record["output"] as Record<string, unknown>)["note"] =
+            "patient narrative: seasonal allergies";
+        }
+      }
+    });
+    await expect(
+      scanPublication("poisoned.nemotrace", poisoned, {}, "poisoned.nemotrace"),
+    ).rejects.toThrow(/output field 'note' does not match the publication-v1 shape/);
+  });
+
+  it("refuses an absolute args path even when paths are kept", async () => {
+    const poisoned = await poisonedSource((events) => {
+      for (const record of Object.values(events)) {
+        if (record["args"] !== undefined && record["args"] !== null) {
+          (record["args"] as Record<string, unknown>)["path"] =
+            "/home/alice/private/candidate.py";
+        }
+      }
+    });
+    await expect(
+      scanPublication(
+        "poisoned.nemotrace",
+        poisoned,
+        { keep_relative_paths: true },
+        "poisoned.nemotrace",
+      ),
+    ).rejects.toThrow(/args field 'path' does not match the publication-v1 shape/);
+  });
+
+  it("drops an unrecognized args name but keeps a redaction pointer", async () => {
+    const poisoned = await poisonedSource((events) => {
+      for (const record of Object.values(events)) {
+        if (record["args"] !== undefined && record["args"] !== null) {
+          (record["args"] as Record<string, unknown>)["private_hint"] =
+            "seasonal allergies";
+        }
+      }
+    });
+    const projection = await scanPublication(
+      "poisoned.nemotrace",
+      poisoned,
+      {},
+      "poisoned.nemotrace",
+    );
+    const text = new TextDecoder().decode(projection.entries["public/events.ndjson"]!);
+    expect(text).not.toContain("seasonal allergies");
+    const records = text
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => parseJsonStrict(line) as Record<string, unknown>);
+    const started = records.find(
+      (record) =>
+        record["kind"] === "tool_call_started" &&
+        (record["redacted_fields"] as string[]).includes("/args/private_hint"),
+    );
+    expect(started).toBeDefined();
+    expect(Object.keys(started!["args"] as Record<string, unknown>)).not.toContain(
+      "private_hint",
+    );
+  });
+
+  it("refuses annotation fields on a plain record", async () => {
+    const poisoned = await poisonedSource((events) => {
+      events["0"] = { ...events["0"]!, anchor_sequence: 1 };
+    });
+    await expect(
+      scanPublication("poisoned.nemotrace", poisoned, {}, "poisoned.nemotrace"),
+    ).rejects.toThrow(/carries annotation fields/);
+  });
+});

@@ -117,6 +117,16 @@ describe("nemotrace-js verify", () => {
     }
   });
 
+  it("fails closed on a degenerate replay manifest against the shared golden", async () => {
+    // A manifest whose deterministic stages no taped tool can satisfy cannot
+    // re-execute. Both CLIs must report the same error state (M-C1).
+    const result = await runCli(["verify", VAULT_FIXTURE, "--replay", "env:NEMOTRACE_TEST_PW"], {
+      NEMOTRACE_TEST_PW: VAULT_PASSPHRASE,
+    });
+    expect(result.code).toBe(1);
+    expect(result.out).toBe(golden("expected-vault-fake-run.replay.txt"));
+  });
+
   it("wrong passphrase fails generically without echoing the value", async () => {
     const secret = "definitely-not-the-passphrase";
     const result = await runCli(["verify", REPLAY_FIXTURE, "--unlock", "env:NEMOTRACE_TEST_PW"], {

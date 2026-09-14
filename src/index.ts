@@ -132,6 +132,11 @@ export {
   manifestFromDict,
   type ReplayReport,
 } from "./replay.js";
+export {
+  canDownloadTraceArchive,
+  downloadTraceArchive,
+  type TraceDownloadEnv,
+} from "./trace-export.js";
 // Publication transform (Phase 5): audit -> attested, vault-free publication.
 export {
   PUBLICATION_ATTESTATION_FORMAT,
