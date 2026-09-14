@@ -5,13 +5,14 @@
  * run/stream parity, seeded-secret absence, terminal statuses, and unchanged
  * live-event behavior. Schema conformance for the shared wire form is proven
  * transitively through the cross-language parity fixture
- * (`docs/trace/schema/test-vectors/parity/`) plus structural assertions here.
+ * (vendored `test-vectors/schema/test-vectors/parity/`) plus structural assertions here.
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { PACKAGE_ROOT, VECTORS_ROOT } from "./vectors.js";
 
 import { WorkflowAgent } from "../agent.js";
 import { fakeAdapter } from "./helpers.js";
@@ -42,9 +43,7 @@ import {
   ref,
 } from "./helpers.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(here, "..", "..", "..", "..");
-const VECTORS = join(ROOT, "docs", "trace", "schema", "test-vectors");
+const VECTORS = VECTORS_ROOT;
 
 const FIXED_TIME = new Date("2026-01-02T03:04:05.000Z");
 const FIXED_TRACE_ID = "0123456789abcdef0123456789abcdef";
@@ -175,7 +174,7 @@ function eventsOf(entries: Record<string, Uint8Array>): Record<string, unknown>[
 describe("trace recorder", () => {
   it("pins the runtime version to package.json", () => {
     const pkg = JSON.parse(
-      readFileSync(join(ROOT, "web", "nemoir-runtime", "package.json"), "utf8"),
+      readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8"),
     ) as { version: string };
     expect(RUNTIME_VERSION).toBe(pkg.version);
   });

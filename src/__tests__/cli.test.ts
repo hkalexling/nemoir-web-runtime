@@ -1,23 +1,22 @@
 /**
  * `nemotrace-js` CLI: golden outputs, exit codes, and passphrase sources.
  *
- * The golden stdout files under `docs/trace/schema/test-vectors/cli/` are
- * shared with the Python suite (`python/nemoir-runtime/tests/test_cli.py`)
+ * The golden stdout files under the vendored
+ * `test-vectors/schema/test-vectors/cli/` are shared with the Python suite (`python/nemoir-runtime/tests/test_cli.py`)
  * and asserted by both, so the two CLIs provably agree byte-for-byte.
  */
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { VECTORS_ROOT } from "./vectors.js";
 
 import { main } from "../cli.js";
 import type { CliIO } from "../cli.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(here, "..", "..", "..", "..");
-const VECTORS = join(ROOT, "docs", "trace", "schema", "test-vectors");
+const VECTORS = VECTORS_ROOT;
 const CLI_VECTORS = join(VECTORS, "cli");
 const AUDIT_FIXTURE = join(VECTORS, "audit-valid.nemotrace");
 const CVXPYGEN_FIXTURE = join(VECTORS, "cvxpygen-public.nemotrace");

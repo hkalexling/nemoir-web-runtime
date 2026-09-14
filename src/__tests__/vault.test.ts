@@ -5,9 +5,10 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { VECTORS_ROOT } from "./vectors.js";
 
 import { canonicalStringify } from "../canonical.js";
 import {
@@ -19,9 +20,7 @@ import {
 } from "../trace.js";
 import type { WorkflowManifest } from "../manifest.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(here, "..", "..", "..", "..");
-const VECTORS = join(ROOT, "docs", "trace", "schema", "test-vectors", "vault");
+const VECTORS = join(VECTORS_ROOT, "vault");
 const FIXED_PASSPHRASE = "phase4-vault-fake-passphrase-01";
 
 function loadFixture(): any {

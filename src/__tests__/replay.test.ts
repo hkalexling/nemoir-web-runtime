@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { VECTORS_ROOT } from "./vectors.js";
+
 import { WorkflowRuntime } from "../runtime.js";
 import { ModelStageExecutor } from "../models.js";
 import { ToolRegistry } from "../tools.js";
@@ -217,11 +219,8 @@ describe("replay", () => {
     // This port resolves tools lazily, so replay must perform the same
     // construction check: reporting "diverged" would overclaim that the
     // recorded path re-executed.
-    const root = join(__dirname, "..", "..", "..", "..");
     const degenerate = new Uint8Array(
-      readFileSync(
-        join(root, "docs", "trace", "schema", "test-vectors", "cli", "vault-fake-run.nemotrace"),
-      ),
+      readFileSync(join(VECTORS_ROOT, "cli", "vault-fake-run.nemotrace")),
     );
     await expect(replayTrace(degenerate, "phase4-vault-fake-passphrase-01")).rejects.toThrow(
       /no registered tool satisfies the required input params and output schema/,

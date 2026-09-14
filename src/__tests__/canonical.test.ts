@@ -1,14 +1,15 @@
 /**
  * Tests for RFC 8785 canonicalization against shared NemoTrace vectors.
  *
- * Vectors live in `docs/trace/schema/test-vectors/jcs/` at the repo root.
- * Vitest runs with cwd = the package dir, so resolve via relative path.
+ * Vectors live in the vendored `test-vectors/schema/test-vectors/jcs/` tree
+ * (a byte-identical copy of the meta vectors; see `vectors.ts`).
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { VECTORS_ROOT } from "./vectors.js";
 
 import {
   canonicalStringify,
@@ -17,11 +18,8 @@ import {
   toCanonicalBytes,
 } from "../canonical.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-// src/__tests__ -> src -> nemoir-runtime -> web -> nemoir (root)
-const ROOT = resolve(here, "..", "..", "..", "..");
-const JCS = join(ROOT, "docs", "trace", "schema", "test-vectors", "jcs");
-const IR = join(ROOT, "docs", "trace", "schema", "test-vectors", "ir-fingerprint");
+const JCS = join(VECTORS_ROOT, "jcs");
+const IR = join(VECTORS_ROOT, "ir-fingerprint");
 
 function float64FromHex(hex: string): number {
   const bytes = new ArrayBuffer(8);

@@ -1,8 +1,8 @@
 /**
  * Phase 5 publication transform: projection, attestation, and refusals.
  *
- * These tests assert the frozen vectors in
- * `docs/trace/schema/test-vectors/publication/` byte for byte, so the Python
+ * These tests assert the frozen vectors in the vendored
+ * `test-vectors/schema/test-vectors/publication/` byte for byte, so the Python
  * and TypeScript transformers provably agree on every logical artifact (the
  * ZIP container differs by DEFLATE implementation and is never compared).
  */
@@ -10,6 +10,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { VECTORS_ROOT } from "./vectors.js";
 
 import { parseJsonStrict, sha256Tag, toCanonicalBytes } from "../canonical.js";
 import {
@@ -23,8 +25,7 @@ import {
 } from "../publication.js";
 import { readArchiveEntries, verifyArchive, writeArchive } from "../trace.js";
 
-const ROOT = join(__dirname, "..", "..", "..", "..");
-const VECTORS = join(ROOT, "docs", "trace", "schema", "test-vectors");
+const VECTORS = VECTORS_ROOT;
 const PUBLICATION = join(VECTORS, "publication");
 const SOURCE_PATH = join(PUBLICATION, "source.nemotrace");
 const SOURCE_BYTES = new Uint8Array(readFileSync(SOURCE_PATH));

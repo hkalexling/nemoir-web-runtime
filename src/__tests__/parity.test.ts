@@ -1,7 +1,8 @@
 /**
  * Cross-language parity: the shared fixture must project byte-identical ledgers.
  *
- * Drives `TraceRecorder` through `docs/trace/schema/test-vectors/parity/fake-run.json`
+ * Drives `TraceRecorder` through the vendored
+ * `test-vectors/schema/test-vectors/parity/fake-run.json`
  * (hooks + observations, fixed clock + trace id) and asserts byte equality with
  * the frozen `expected-ledger.ndjson` / `expected-graph.json`. The Python suite
  * (`python/nemoir-runtime/tests/test_parity.py`) asserts the same files, so both
@@ -9,16 +10,15 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { VECTORS_ROOT } from "./vectors.js";
 
 import type { WorkflowManifest } from "../manifest.js";
 import { TraceRecorder, readArchiveEntries, verifyArchive } from "../trace.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(here, "..", "..", "..", "..");
-const PARITY = join(ROOT, "docs", "trace", "schema", "test-vectors", "parity");
+const PARITY = join(VECTORS_ROOT, "parity");
 
 interface FixtureManifest {
   workflow_id: string;
